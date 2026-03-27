@@ -42,8 +42,9 @@ class CLI:
         if had_active_task:
             self._active_message_task = None
             self.tui.clear_status()
-            console.print(
-                "\n[warning]Stopped current run. Ready for the next prompt.[/warning]"
+            self.tui.show_notice(
+                "Stopped current run. Ready for the next prompt.",
+                level="warning",
             )
             return True
 
@@ -55,15 +56,7 @@ class CLI:
             return await self._process_message(message)
 
     async def run_interactive(self) -> str | None:
-        self.tui.print_welcome(
-            "Jazz-Code",
-            lines=[
-                f"model: {self.config.model_name}",
-                f"cwd: {self.config.cwd}",
-                "commands: /help /config /approval /model /exit",
-                "Ctrl+C: stop current run",
-            ],
-        )
+        self.tui.print_welcome()
 
         async with Agent(
             self.config,
@@ -73,7 +66,7 @@ class CLI:
 
             while True:
                 try:
-                    user_input = console.input("\n[user]>[/user] ").strip()
+                    user_input = console.input(self.tui.prompt()).strip()
                     if not user_input:
                         continue
 
@@ -98,23 +91,20 @@ class CLI:
                 except KeyboardInterrupt:
                     stopped = await self._stop_active_run()
                     if not stopped:
-                        console.print(
-                            "\n[dim]Press Ctrl+C to stop a run or use /exit to quit[/dim]"
+                        self.tui.show_notice(
+                            "Press Ctrl+C to stop a run or use /exit to quit.",
+                            level="info",
                         )
                 except EOFError:
                     break
 
-        console.print("\n[dim]Goodbye![/dim]")
+        self.tui.show_notice("Goodbye!", level="info")
 
     def _get_tool_kind(self, tool_name: str) -> str | None:
-        tool_kind = None
         tool = self.agent.session.tool_registry.get(tool_name)
         if not tool:
-            tool_kind = None
-
-        tool_kind = tool.kind.value
-
-        return tool_kind
+            return None
+        return tool.kind.value
 
     async def _process_message(self, message: str) -> str | None:
         if not self.agent:
@@ -146,7 +136,7 @@ class CLI:
                 elif event.type == AgentEventType.AGENT_ERROR:
                     error = event.data.get("error", "Unknown error")
                     self.tui.clear_status()
-                    console.print(f"\n[error]Error: {error}[/error]")
+                    self.tui.show_notice(f"Error: {error}", level="error")
                 elif event.type == AgentEventType.TOOL_CALL_START:
                     tool_name = event.data.get("name", "unknown")
                     tool_kind = self._get_tool_kind(tool_name)
@@ -191,57 +181,54 @@ class CLI:
         elif command == "/clear":
             self.agent.session.context_manager.clear()
             self.agent.session.loop_detector.clear()
-            console.print("[success]Conversation cleared [/success]")
+            self.tui.show_notice("Conversation cleared.", level="success")
         elif command == "/config":
-            console.print("\n[bold]Current Configuration[/bold]")
-            console.print(f"  Model: {self.config.model_name}")
-            console.print(f"  Temperature: {self.config.temperature}")
-            console.print(f"  Approval: {self.config.approval.value}")
-            console.print(f"  Working Dir: {self.config.cwd}")
-            console.print(f"  Max Turns: {self.config.max_turns}")
-            console.print(f"  Hooks Enabled: {self.config.hooks_enabled}")
+            self.tui.show_config()
         elif cmd_name == "/model":
             if cmd_args:
                 self.config.model_name = cmd_args
-                console.print(f"[success]Model changed to: {cmd_args} [/success]")
+                self.tui.show_notice(
+                    f"Model changed to: {cmd_args}",
+                    level="success",
+                )
             else:
-                console.print(f"Current model: {self.config.model_name}")
+                self.tui.show_notice(
+                    f"Current model: {self.config.model_name}",
+                    level="info",
+                )
         elif cmd_name == "/approval":
             if cmd_args:
                 try:
                     approval = ApprovalPolicy(cmd_args)
                     self.config.approval = approval
-                    console.print(
-                        f"[success]Approval policy changed to: {cmd_args} [/success]"
+                    self.tui.show_notice(
+                        f"Approval policy changed to: {cmd_args}",
+                        level="success",
                     )
                 except:
-                    console.print(
-                        f"[error]Incorrect approval policy: {cmd_args} [/error]"
+                    self.tui.show_notice(
+                        f"Incorrect approval policy: {cmd_args}",
+                        level="error",
                     )
-                    console.print(
-                        f"Valid options: {', '.join(p for p in ApprovalPolicy)}"
+                    self.tui.show_notice(
+                        "Valid options: "
+                        + ", ".join(policy.value for policy in ApprovalPolicy),
+                        level="info",
                     )
             else:
-                console.print(f"Current approval policy: {self.config.approval.value}")
+                self.tui.show_notice(
+                    f"Current approval policy: {self.config.approval.value}",
+                    level="info",
+                )
         elif cmd_name == "/stats":
             stats = self.agent.session.get_stats()
-            console.print("\n[bold]Session Statistics [/bold]")
-            for key, value in stats.items():
-                console.print(f"   {key}: {value}")
+            self.tui.show_stats(stats)
         elif cmd_name == "/tools":
             tools = self.agent.session.tool_registry.get_tools()
-            console.print(f"\n[bold]Available tools ({len(tools)}) [/bold]")
-            for tool in tools:
-                console.print(f"  • {tool.name}")
+            self.tui.show_tools(tools)
         elif cmd_name == "/mcp":
             mcp_servers = self.agent.session.mcp_manager.get_all_servers()
-            console.print(f"\n[bold]MCP Servers ({len(mcp_servers)}) [/bold]")
-            for server in mcp_servers:
-                status = server["status"]
-                status_color = "green" if status == "connected" else "red"
-                console.print(
-                    f"  • {server['name']}: [{status_color}]{status}[/{status_color}] ({server['tools']} tools)"
-                )
+            self.tui.show_mcp_servers(mcp_servers)
         elif cmd_name == "/save":
             persistence_manager = PersistenceManager()
             session_snapshot = SessionSnapshot(
@@ -253,25 +240,25 @@ class CLI:
                 total_usage=self.agent.session.context_manager.total_usage,
             )
             persistence_manager.save_session(session_snapshot)
-            console.print(
-                f"[success]Session saved: {self.agent.session.session_id}[/success]"
+            self.tui.show_notice(
+                f"Session saved: {self.agent.session.session_id}",
+                level="success",
             )
         elif cmd_name == "/sessions":
             persistence_manager = PersistenceManager()
             sessions = persistence_manager.list_sessions()
-            console.print("\n[bold]Saved Sessions[/bold]")
-            for s in sessions:
-                console.print(
-                    f"  • {s['session_id']} (turns: {s['turn_count']}, updated: {s['updated_at']})"
-                )
+            self.tui.show_saved_sessions(sessions, "Saved sessions")
         elif cmd_name == "/resume":
             if not cmd_args:
-                console.print(f"[error]Usage: /resume <session_id> [/error]")
+                self.tui.show_notice(
+                    "Usage: /resume <session_id>",
+                    level="error",
+                )
             else:
                 persistence_manager = PersistenceManager()
                 snapshot = persistence_manager.load_session(cmd_args)
                 if not snapshot:
-                    console.print(f"[error]Session does not exist [/error]")
+                    self.tui.show_notice("Session does not exist.", level="error")
                 else:
                     session = Session(
                         config=self.config,
@@ -303,8 +290,9 @@ class CLI:
                     await self.agent.session.mcp_manager.shutdown()
 
                     self.agent.session = session
-                    console.print(
-                        f"[success]Resumed session: {session.session_id}[/success]"
+                    self.tui.show_notice(
+                        f"Resumed session: {session.session_id}",
+                        level="success",
                     )
         elif cmd_name == "/checkpoint":
             persistence_manager = PersistenceManager()
@@ -317,15 +305,21 @@ class CLI:
                 total_usage=self.agent.session.context_manager.total_usage,
             )
             checkpoint_id = persistence_manager.save_checkpoint(session_snapshot)
-            console.print(f"[success]Checkpoint created: {checkpoint_id}[/success]")
+            self.tui.show_notice(
+                f"Checkpoint created: {checkpoint_id}",
+                level="success",
+            )
         elif cmd_name == "/restore":
             if not cmd_args:
-                console.print(f"[error]Usage: /restire <checkpoint_id> [/error]")
+                self.tui.show_notice(
+                    "Usage: /restore <checkpoint_id>",
+                    level="error",
+                )
             else:
                 persistence_manager = PersistenceManager()
                 snapshot = persistence_manager.load_checkpoint(cmd_args)
                 if not snapshot:
-                    console.print(f"[error]Checkpoint does not exist [/error]")
+                    self.tui.show_notice("Checkpoint does not exist.", level="error")
                 else:
                     session = Session(
                         config=self.config,
@@ -357,11 +351,12 @@ class CLI:
                     await self.agent.session.mcp_manager.shutdown()
 
                     self.agent.session = session
-                    console.print(
-                        f"[success]Resumed session: {session.session_id}, checkpoint: {checkpoint_id}[/success]"
+                    self.tui.show_notice(
+                        f"Restored checkpoint into session: {session.session_id}",
+                        level="success",
                     )
         else:
-            console.print(f"[error]Unknown command: {cmd_name}[/error]")
+            self.tui.show_notice(f"Unknown command: {cmd_name}", level="error")
 
         return True
 

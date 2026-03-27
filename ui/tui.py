@@ -1,50 +1,66 @@
+from __future__ import annotations
+
+import re
 from pathlib import Path
-from typing import Any
-from rich.console import Console
-from rich.theme import Theme
-from rich.rule import Rule
-from rich.text import Text
-from rich.panel import Panel
-from rich.table import Table
+from typing import Any, Iterable
+
 from rich import box
+from rich.columns import Columns
+from rich.console import Console, Group
+from rich.panel import Panel
 from rich.prompt import Prompt
-from rich.console import Group
+from rich.rule import Rule
 from rich.syntax import Syntax
-from rich.markdown import Markdown
+from rich.table import Table
+from rich.text import Text
+from rich.theme import Theme
+
 from config.config import Config
 from tools.base import ToolConfirmation
 from utils.paths import display_path_rel_to_cwd
-import re
-
 from utils.text import truncate_text
 
 AGENT_THEME = Theme(
     {
-        # General
-        "info": "cyan",
+        "info": "bright_cyan",
         "warning": "yellow",
         "error": "bright_red bold",
         "success": "green",
-        "dim": "dim",
-        "muted": "grey50",
-        "thinking": "italic grey62",
-        "border": "grey35",
-        "highlight": "bold cyan",
-        # Roles
+        "muted": "grey58",
+        "dim": "grey42",
+        "surface": "grey11",
+        "surface.alt": "grey15",
+        "panel.border": "grey27",
+        "panel.title": "bold bright_cyan",
+        "panel.subtitle": "grey58",
+        "brand": "bold bright_cyan",
+        "brand.badge": "bold black on bright_cyan",
+        "chip": "bold black on grey70",
+        "prompt": "bold bright_cyan",
+        "prompt.hint": "grey58",
         "user": "bright_blue bold",
+        "user.badge": "bold black on bright_blue",
         "assistant": "bright_white",
+        "assistant.badge": "bold black on bright_cyan",
         "assistant.inline_code": "bold bright_white on grey23",
         "assistant.code_block": "white on grey11",
-        # Tools
-        "tool": "bright_magenta bold",
+        "thinking": "italic grey70",
+        "thinking.badge": "bold black on grey78",
+        "meta.label": "grey58",
+        "meta.value": "bright_white",
+        "tool": "bold bright_magenta",
+        "tool.badge": "bold black on bright_magenta",
         "tool.read": "cyan",
         "tool.write": "yellow",
         "tool.shell": "magenta",
         "tool.network": "bright_blue",
         "tool.memory": "green",
         "tool.mcp": "bright_cyan",
-        # Code / blocks
-        "code": "white",
+        "status.info.badge": "bold black on bright_cyan",
+        "status.success.badge": "bold black on green",
+        "status.warning.badge": "bold black on yellow",
+        "status.error.badge": "bold white on bright_red",
+        "code": "bright_white",
     }
 )
 
@@ -55,7 +71,6 @@ def get_console() -> Console:
     global _console
     if _console is None:
         _console = Console(theme=AGENT_THEME, highlight=False)
-
     return _console
 
 
@@ -66,19 +81,133 @@ class TUI:
         console: Console | None = None,
     ) -> None:
         self.console = console or get_console()
-        self._assistant_stream_open = False
-        self._tool_args_by_call_id: dict[str, dict[str, Any]] = {}
         self.config = config
         self.cwd = self.config.cwd
-        self._max_block_tokens = 2500
-        self._last_status: str | None = None
+        self._assistant_stream_open = False
         self._assistant_mode = "text"
         self._assistant_pending_backticks = ""
         self._assistant_fence_header_pending = False
+        self._tool_args_by_call_id: dict[str, dict[str, Any]] = {}
+        self._max_block_tokens = 2500
+        self._last_status: str | None = None
+
+    def _badge(self, label: str, style: str) -> Text:
+        return Text(f" {label.upper()} ", style=style)
+
+    def _chip_row(self, items: Iterable[str]) -> Text:
+        text = Text()
+        for index, item in enumerate(items):
+            if index:
+                text.append(" ")
+            text.append_text(self._badge(item, "chip"))
+        return text
+
+    def _section_title(self, label: str, badge_style: str, title_style: str) -> Text:
+        title = Text()
+        title.append_text(self._badge(label, badge_style))
+        title.append(" ")
+        title.append(label.title(), style=title_style)
+        return title
+
+    def _panel(
+        self,
+        body,
+        *,
+        title: Text | str | None = None,
+        subtitle: Text | str | None = None,
+        border_style: str = "panel.border",
+        padding: tuple[int, int] = (1, 2),
+    ) -> Panel:
+        return Panel(
+            body,
+            title=title,
+            title_align="left",
+            subtitle=subtitle,
+            subtitle_align="right",
+            border_style=border_style,
+            box=box.ROUNDED,
+            padding=padding,
+        )
+
+    def _kv_table(
+        self,
+        rows: Iterable[tuple[str, Any]],
+        *,
+        wrap_values: bool = True,
+    ) -> Table:
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(style="meta.label", no_wrap=True)
+        table.add_column(style="meta.value", overflow="fold" if wrap_values else "ellipsis")
+
+        for key, value in rows:
+            table.add_row(str(key), str(value))
+
+        return table
+
+    def _summary_text(self, parts: Iterable[Any], style: str = "muted") -> Text:
+        clean_parts = [str(part) for part in parts if part not in (None, "", [])]
+        return Text(" • ".join(clean_parts), style=style)
+
+    def prompt(self) -> str:
+        return "\n[user.badge] YOU [/user.badge] [prompt]›[/prompt] "
+
+    def print_welcome(self) -> None:
+        header = Text()
+        header.append_text(self._badge("Jazz-Code", "brand.badge"))
+        header.append(" ")
+        header.append("Agent Console", style="brand")
+
+        subtitle = Text(
+            "A local coding shell with streaming replies, tool execution, approvals, and session controls.",
+            style="muted",
+        )
+
+        overview = self._panel(
+            self._kv_table(
+                [
+                    ("Model", self.config.model_name),
+                    ("Workspace", self.config.cwd),
+                    ("Approval", self.config.approval.value),
+                    ("Max turns", self.config.max_turns),
+                ]
+            ),
+            title=Text("Session", style="panel.title"),
+        )
+
+        controls = self._panel(
+            Group(
+                self._chip_row(["/help", "/config", "/approval", "/model", "/exit"]),
+                Text(""),
+                Text("Ctrl+C stops the current run without quitting.", style="muted"),
+                Text("Type a prompt to start working in the current workspace.", style="muted"),
+            ),
+            title=Text("Controls", style="panel.title"),
+        )
+
+        body = Group(
+            header,
+            subtitle,
+            Text(""),
+            Columns([overview, controls], expand=True, equal=True),
+        )
+
+        self.console.print()
+        self.console.print(
+            self._panel(
+                body,
+                title=Text("Terminal UI", style="panel.title"),
+                subtitle=Text("ready", style="panel.subtitle"),
+            )
+        )
 
     def begin_assistant(self) -> None:
+        title = Text()
+        title.append_text(self._badge("Assistant", "assistant.badge"))
+        title.append(" ")
+        title.append("Jazz-Code", style="assistant")
+
         self.console.print()
-        self.console.print(Rule(Text("Assistant", style="assistant")))
+        self.console.print(Rule(title, style="panel.border"))
         self._assistant_stream_open = True
         self._assistant_mode = "text"
         self._assistant_pending_backticks = ""
@@ -104,9 +233,8 @@ class TUI:
         if not self._assistant_pending_backticks:
             return
 
-        style = self._assistant_text_style()
         self.console.print(
-            Text(self._assistant_pending_backticks, style=style),
+            Text(self._assistant_pending_backticks, style=self._assistant_text_style()),
             end="",
         )
         self._assistant_pending_backticks = ""
@@ -139,7 +267,7 @@ class TUI:
         segment_style = self._assistant_text_style()
 
         def flush_segment() -> None:
-            nonlocal segment_buffer, segment_style
+            nonlocal segment_buffer
             if segment_buffer:
                 rendered.append("".join(segment_buffer), style=segment_style)
                 segment_buffer = []
@@ -154,7 +282,7 @@ class TUI:
                     new_style = self._assistant_text_style()
                     if new_style != segment_style:
                         flush_segment()
-                        segment_style = new_style
+                    segment_style = new_style
                     segment_buffer.append(char)
                 i += 1
                 continue
@@ -179,14 +307,12 @@ class TUI:
                         self._assistant_fence_header_pending = True
                     segment_style = self._assistant_text_style()
                 elif len(tick_run) == 1 and self._assistant_mode != "fenced_code":
-                    if self._assistant_mode == "inline_code":
-                        self._assistant_mode = "text"
-                    else:
-                        self._assistant_mode = "inline_code"
+                    self._assistant_mode = (
+                        "text" if self._assistant_mode == "inline_code" else "inline_code"
+                    )
                     segment_style = self._assistant_text_style()
                 else:
-                    literal_style = self._assistant_text_style()
-                    rendered.append(tick_run, style=literal_style)
+                    rendered.append(tick_run, style=self._assistant_text_style())
                     segment_style = self._assistant_text_style()
 
                 i = run_end
@@ -208,15 +334,49 @@ class TUI:
         if message == self._last_status:
             return
 
+        label = "status"
+        detail = message
+        if ":" in message:
+            prefix, suffix = message.split(":", 1)
+            if prefix.strip():
+                label = prefix.strip()
+                detail = suffix.strip() or prefix.strip()
+
+        line = Text()
+        line.append_text(self._badge(label, "thinking.badge"))
+        line.append(" ")
+        line.append(detail, style="thinking")
+
         self.console.print()
-        self.console.print(Text(message, style="thinking"))
+        self.console.print(line)
         self._last_status = message
 
     def clear_status(self) -> None:
         self._last_status = None
 
-    def _ordered_args(self, tool_name: str, args: dict[str, Any]) -> list[tuple]:
-        _PREFERRED_ORDER = {
+    def show_notice(self, message: str, level: str = "info") -> None:
+        badge_style = {
+            "info": "status.info.badge",
+            "success": "status.success.badge",
+            "warning": "status.warning.badge",
+            "error": "status.error.badge",
+        }.get(level, "status.info.badge")
+        text_style = {
+            "info": "info",
+            "success": "success",
+            "warning": "warning",
+            "error": "error",
+        }.get(level, "info")
+
+        line = Text()
+        line.append_text(self._badge(level, badge_style))
+        line.append(" ")
+        line.append(message, style=text_style)
+        self.console.print()
+        self.console.print(line)
+
+    def _ordered_args(self, tool_name: str, args: dict[str, Any]) -> list[tuple[str, Any]]:
+        preferred_order = {
             "read_file": ["path", "offset", "limit"],
             "write_file": ["path", "create_directories", "content"],
             "edit": ["path", "replace_all", "old_string", "new_string"],
@@ -228,38 +388,47 @@ class TUI:
             "memory": ["action", "key", "value"],
         }
 
-        preferred = _PREFERRED_ORDER.get(tool_name, [])
+        preferred = preferred_order.get(tool_name, [])
         ordered: list[tuple[str, Any]] = []
-        seen = set()
+        seen: set[str] = set()
 
         for key in preferred:
             if key in args:
                 ordered.append((key, args[key]))
                 seen.add(key)
 
-        remaining_keys = set(args.keys() - seen)
-        ordered.extend((key, args[key]) for key in remaining_keys)
+        for key in args:
+            if key not in seen:
+                ordered.append((key, args[key]))
 
         return ordered
 
     def _render_args_table(self, tool_name: str, args: dict[str, Any]) -> Table:
-        table = Table.grid(padding=(0, 1))
-        table.add_column(style="muted", justify="right", no_wrap=True)
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(style="meta.label", justify="right", no_wrap=True)
         table.add_column(style="code", overflow="fold")
 
         for key, value in self._ordered_args(tool_name, args):
-            if isinstance(value, str):
-                if key in {"content", "old_string", "new_string"}:
-                    line_count = len(value.splitlines()) or 0
-                    byte_count = len(value.encode("utf-8", errors="replace"))
-                    value = f"<{line_count} lines • {byte_count} bytes>"
+            if isinstance(value, str) and key in {"content", "old_string", "new_string"}:
+                line_count = len(value.splitlines()) or 0
+                byte_count = len(value.encode("utf-8", errors="replace"))
+                value = f"<{line_count} lines • {byte_count} bytes>"
+            elif isinstance(value, bool):
+                value = str(value).lower()
 
-            if isinstance(value, bool):
-                value = str(value)
-
-            table.add_row(key, value)
+            table.add_row(key, str(value))
 
         return table
+
+    def _tool_title(self, label: str, name: str, call_id: str, style: str) -> Text:
+        title = Text()
+        title.append_text(self._badge(label, style))
+        title.append(" ")
+        title.append(name, style="tool")
+        if call_id:
+            title.append("  ")
+            title.append(f"#{call_id[:8]}", style="muted")
+        return title
 
     def tool_call_start(
         self,
@@ -271,38 +440,27 @@ class TUI:
         self._tool_args_by_call_id[call_id] = arguments
         border_style = f"tool.{tool_kind}" if tool_kind else "tool"
 
-        title = Text.assemble(
-            ("⏺ ", "muted"),
-            (name, "tool"),
-            ("  ", "muted"),
-            (f"#{call_id[:8]}", "muted"),
-        )
-
         display_args = dict(arguments)
         for key in ("path", "cwd"):
-            val = display_args.get(key)
-            if isinstance(val, str) and self.cwd:
-                display_args[key] = str(display_path_rel_to_cwd(val, self.cwd))
+            value = display_args.get(key)
+            if isinstance(value, str) and self.cwd:
+                display_args[key] = str(display_path_rel_to_cwd(value, self.cwd))
 
-        panel = Panel(
-            (
-                self._render_args_table(name, display_args)
-                if display_args
-                else Text(
-                    "(no args)",
-                    style="muted",
-                )
-            ),
-            title=title,
-            title_align="left",
-            subtitle=Text("running", style="muted"),
-            subtitle_align="right",
-            border_style=border_style,
-            box=box.ROUNDED,
-            padding=(1, 2),
+        body = (
+            self._render_args_table(name, display_args)
+            if display_args
+            else Text("No arguments provided", style="muted")
         )
+
         self.console.print()
-        self.console.print(panel)
+        self.console.print(
+            self._panel(
+                body,
+                title=self._tool_title("Tool", name, call_id, "tool.badge"),
+                subtitle=Text("running", style="panel.subtitle"),
+                border_style=border_style,
+            )
+        )
 
     def _extract_read_file_code(self, text: str) -> tuple[int, str] | None:
         body = text
@@ -315,15 +473,13 @@ class TUI:
         start_line: int | None = None
 
         for line in body.splitlines():
-            # 1|def main():
-            # 2| print()
-            m = re.match(r"^\s*(\d+)\|(.*)$", line)
-            if not m:
+            match = re.match(r"^\s*(\d+)\|(.*)$", line)
+            if not match:
                 return None
-            line_no = int(m.group(1))
+            line_no = int(match.group(1))
             if start_line is None:
                 start_line = line_no
-            code_lines.append(m.group(2))
+            code_lines.append(match.group(2))
 
         if start_line is None:
             return None
@@ -333,6 +489,7 @@ class TUI:
     def _guess_language(self, path: str | None) -> str:
         if not path:
             return "text"
+
         suffix = Path(path).suffix.lower()
         return {
             ".py": "python",
@@ -361,19 +518,22 @@ class TUI:
             ".html": "html",
             ".xml": "xml",
             ".sql": "sql",
+            ".asm": "nasm",
         }.get(suffix, "text")
 
-    def print_welcome(self, title: str, lines: list[str]) -> None:
-        body = "\n".join(lines)
-        self.console.print(
-            Panel(
-                Text(body, style="code"),
-                title=Text(title, style="highlight"),
-                title_align="left",
-                border_style="border",
-                box=box.ROUNDED,
-                padding=(1, 2),
-            )
+    def _render_output_block(
+        self,
+        content: str,
+        language: str = "text",
+        *,
+        word_wrap: bool = True,
+    ) -> Syntax:
+        return Syntax(
+            content,
+            language,
+            theme="monokai",
+            word_wrap=word_wrap,
+            line_numbers=False,
         )
 
     def tool_call_complete(
@@ -390,78 +550,69 @@ class TUI:
         exit_code: int | None,
     ) -> None:
         border_style = f"tool.{tool_kind}" if tool_kind else "tool"
-        status_icon = "✓" if success else "✗"
-        status_style = "success" if success else "error"
-
-        title = Text.assemble(
-            (f"{status_icon} ", status_style),
-            (name, "tool"),
-            ("  ", "muted"),
-            (f"#{call_id[:8]}", "muted"),
-        )
+        state = "done" if success else "failed"
+        state_style = "status.success.badge" if success else "status.error.badge"
 
         args = self._tool_args_by_call_id.get(call_id, {})
-
-        primary_path = None
-        blocks = []
-        if isinstance(metadata, dict) and isinstance(metadata.get("path"), str):
-            primary_path = metadata.get("path")
+        blocks: list[Any] = []
+        primary_path = (
+            metadata.get("path")
+            if isinstance(metadata, dict) and isinstance(metadata.get("path"), str)
+            else None
+        )
 
         if name == "read_file" and success:
             if primary_path:
-                start_line, code = self._extract_read_file_code(output)
-
-                shown_start = metadata.get("shown_start")
-                shown_end = metadata.get("shown_end")
-                total_lines = metadata.get("total_lines")
-                pl = self._guess_language(primary_path)
-
-                header_parts = [display_path_rel_to_cwd(primary_path, self.cwd)]
-                header_parts.append(" • ")
-
-                if shown_start and shown_end and total_lines:
-                    header_parts.append(
-                        f"lines {shown_start}-{shown_end} of {total_lines}"
-                    )
-
-                header = "".join(header_parts)
-                blocks.append(Text(header, style="muted"))
-                blocks.append(
-                    Syntax(
-                        code,
-                        pl,
-                        theme="monokai",
-                        line_numbers=True,
-                        start_line=start_line,
-                        word_wrap=False,
-                    )
+                parsed = self._extract_read_file_code(output)
+                shown_start = metadata.get("shown_start") if metadata else None
+                shown_end = metadata.get("shown_end") if metadata else None
+                total_lines = metadata.get("total_lines") if metadata else None
+                header = self._summary_text(
+                    [
+                        display_path_rel_to_cwd(primary_path, self.cwd),
+                        (
+                            f"lines {shown_start}-{shown_end} of {total_lines}"
+                            if shown_start and shown_end and total_lines
+                            else None
+                        ),
+                    ]
                 )
+                blocks.append(header)
+
+                if parsed:
+                    start_line, code = parsed
+                    blocks.append(
+                        Syntax(
+                            code,
+                            self._guess_language(primary_path),
+                            theme="monokai",
+                            line_numbers=True,
+                            start_line=start_line,
+                            word_wrap=False,
+                        )
+                    )
+                else:
+                    blocks.append(
+                        self._render_output_block(
+                            truncate_text(output, "", self._max_block_tokens),
+                            self._guess_language(primary_path),
+                            word_wrap=False,
+                        )
+                    )
             else:
-                output_display = truncate_text(
-                    output,
-                    "",
-                    self._max_block_tokens,
-                )
                 blocks.append(
-                    Syntax(
-                        output_display,
+                    self._render_output_block(
+                        truncate_text(output, "", self._max_block_tokens),
                         "text",
-                        theme="monokai",
                         word_wrap=False,
                     )
                 )
         elif name in {"write_file", "edit"} and success and diff:
-            output_line = output.strip() if output.strip() else "Completed"
-            blocks.append(Text(output_line, style="muted"))
-            diff_text = diff
-            diff_display = truncate_text(
-                diff_text,
-                self.config.model_name,
-                self._max_block_tokens,
-            )
+            if output.strip():
+                blocks.append(Text(output.strip(), style="muted"))
             blocks.append(
                 Syntax(
-                    diff_display,
+                    truncate_text(diff, self.config.model_name, self._max_block_tokens),
                     "diff",
                     theme="monokai",
                     word_wrap=True,
@@ -471,235 +622,156 @@ class TUI:
             command = args.get("command")
             if isinstance(command, str) and command.strip():
                 blocks.append(Text(f"$ {command.strip()}", style="muted"))
-
             if exit_code is not None:
                 blocks.append(Text(f"exit_code={exit_code}", style="muted"))
-
-            output_display = truncate_text(
-                output,
-                self.config.model_name,
-                self._max_block_tokens,
-            )
             blocks.append(
-                Syntax(
-                    output_display,
-                    "text",
-                    theme="monokai",
-                    word_wrap=True,
+                self._render_output_block(
+                    truncate_text(output, self.config.model_name, self._max_block_tokens)
                 )
             )
         elif name == "list_dir" and success:
-            entries = metadata.get("entries")
-            path = metadata.get("path")
-            summary = []
-            if isinstance(path, str):
-                summary.append(path)
-
-            if isinstance(entries, int):
-                summary.append(f"{entries} entries")
-
-            if summary:
-                blocks.append(Text(" • ".join(summary), style="muted"))
-
-            output_display = truncate_text(
-                output,
-                self.config.model_name,
-                self._max_block_tokens,
+            blocks.append(
+                self._summary_text(
+                    [
+                        metadata.get("path") if metadata else None,
+                        (
+                            f"{metadata.get('entries')} entries"
+                            if metadata and isinstance(metadata.get("entries"), int)
+                            else None
+                        ),
+                    ]
+                )
             )
             blocks.append(
-                Syntax(
-                    output_display,
-                    "text",
-                    theme="monokai",
-                    word_wrap=True,
+                self._render_output_block(
+                    truncate_text(output, self.config.model_name, self._max_block_tokens)
                 )
             )
         elif name == "grep" and success:
-            matches = metadata.get("matches")
-            files_searched = metadata.get("files_searched")
-            summary = []
-            if isinstance(matches, int):
-                summary.append(f"{matches} matches")
-            if isinstance(files_searched, int):
-                summary.append(f"searched {files_searched} files")
-
-            if summary:
-                blocks.append(Text(" • ".join(summary), style="muted"))
-
-            output_display = truncate_text(
-                output, self.config.model_name, self._max_block_tokens
+            blocks.append(
+                self._summary_text(
+                    [
+                        (
+                            f"{metadata.get('matches')} matches"
+                            if metadata and isinstance(metadata.get("matches"), int)
+                            else None
+                        ),
+                        (
+                            f"searched {metadata.get('files_searched')} files"
+                            if metadata and isinstance(metadata.get("files_searched"), int)
+                            else None
+                        ),
+                    ]
+                )
             )
             blocks.append(
-                Syntax(
-                    output_display,
-                    "text",
-                    theme="monokai",
-                    word_wrap=True,
+                self._render_output_block(
+                    truncate_text(output, self.config.model_name, self._max_block_tokens)
                 )
             )
         elif name == "glob" and success:
-            matches = metadata.get("matches")
-            if isinstance(matches, int):
-                blocks.append(Text(f"{matches} matches", style="muted"))
-
-            output_display = truncate_text(
-                output,
-                self.config.model_name,
-                self._max_block_tokens,
-            )
+            if metadata and isinstance(metadata.get("matches"), int):
+                blocks.append(Text(f"{metadata['matches']} matches", style="muted"))
             blocks.append(
-                Syntax(
-                    output_display,
-                    "text",
-                    theme="monokai",
-                    word_wrap=True,
+                self._render_output_block(
+                    truncate_text(output, self.config.model_name, self._max_block_tokens)
                 )
             )
         elif name == "web_search" and success:
-            results = metadata.get("results")
-            query = args.get("query")
-            summary = []
-            if isinstance(query, str):
-                summary.append(query)
-            if isinstance(results, int):
-                summary.append(f"{results} results")
-
-            if summary:
-                blocks.append(Text(" • ".join(summary), style="muted"))
-
-            output_display = truncate_text(
-                output,
-                self.config.model_name,
-                self._max_block_tokens,
+            blocks.append(
+                self._summary_text(
+                    [
+                        args.get("query"),
+                        (
+                            f"{metadata.get('results')} results"
+                            if metadata and isinstance(metadata.get("results"), int)
+                            else None
+                        ),
+                    ]
+                )
             )
             blocks.append(
-                Syntax(
-                    output_display,
-                    "text",
-                    theme="monokai",
-                    word_wrap=True,
+                self._render_output_block(
+                    truncate_text(output, self.config.model_name, self._max_block_tokens)
                 )
             )
         elif name == "web_fetch" and success:
-            status_code = metadata.get("status_code")
-            content_length = metadata.get("content_length")
-            url = args.get("url")
-            summary = []
-            if isinstance(status_code, int):
-                summary.append(str(status_code))
-            if isinstance(content_length, int):
-                summary.append(f"{content_length} bytes")
-            if isinstance(url, str):
-                summary.append(url)
-
-            if summary:
-                blocks.append(Text(" • ".join(summary), style="muted"))
-
-            output_display = truncate_text(
-                output,
-                self.config.model_name,
-                self._max_block_tokens,
-            )
             blocks.append(
-                Syntax(
-                    output_display,
-                    "text",
-                    theme="monokai",
-                    word_wrap=True,
+                self._summary_text(
+                    [
+                        metadata.get("status_code") if metadata else None,
+                        (
+                            f"{metadata.get('content_length')} bytes"
+                            if metadata and isinstance(metadata.get("content_length"), int)
+                            else None
+                        ),
+                        args.get("url"),
+                    ]
                 )
             )
-        elif name == "todos" and success:
-            output_display = truncate_text(
-                output,
-                self.config.model_name,
-                self._max_block_tokens,
-            )
             blocks.append(
-                Syntax(
-                    output_display,
-                    "text",
-                    theme="monokai",
-                    word_wrap=True,
+                self._render_output_block(
+                    truncate_text(output, self.config.model_name, self._max_block_tokens)
                 )
             )
-        elif name == "memory" and success:
-            action = args.get("action")
-            key = args.get("key")
-            found = metadata.get("found")
-            summary = []
-            if isinstance(action, str) and action:
-                summary.append(action)
-            if isinstance(key, str) and key:
-                summary.append(key)
-            if isinstance(found, bool):
-                summary.append("found" if found else "missing")
-
-            if summary:
-                blocks.append(Text(" • ".join(summary), style="muted"))
-            output_display = truncate_text(
-                output,
-                self.config.model_name,
-                self._max_block_tokens,
-            )
+        elif name in {"todos", "memory"} and success:
+            if name == "memory":
+                blocks.append(
+                    self._summary_text(
+                        [
+                            args.get("action"),
+                            args.get("key"),
+                            (
+                                "found"
+                                if metadata and metadata.get("found") is True
+                                else "missing"
+                                if metadata and metadata.get("found") is False
+                                else None
+                            ),
+                        ]
+                    )
+                )
             blocks.append(
-                Syntax(
-                    output_display,
-                    "text",
-                    theme="monokai",
-                    word_wrap=True,
+                self._render_output_block(
+                    truncate_text(output, self.config.model_name, self._max_block_tokens)
                 )
             )
         else:
             if error and not success:
                 blocks.append(Text(error, style="error"))
 
-            output_display = truncate_text(
-                output, self.config.model_name, self._max_block_tokens
-            )
+            output_display = truncate_text(output, self.config.model_name, self._max_block_tokens)
             if output_display.strip():
-                blocks.append(
-                    Syntax(
-                        output_display,
-                        "text",
-                        theme="monokai",
-                        word_wrap=True,
-                    )
-                )
-            else:
-                blocks.append(Text("(no output)", style="muted"))
+                blocks.append(self._render_output_block(output_display))
+            elif not error:
+                blocks.append(Text("No output", style="muted"))
 
         if truncated:
-            blocks.append(Text("note: tool output was truncated", style="warning"))
+            blocks.append(Text("Tool output was truncated to keep the interface readable.", style="warning"))
 
-        panel = Panel(
-            Group(
-                *blocks,
-            ),
-            title=title,
-            title_align="left",
-            subtitle=Text("done" if success else "failed", style=status_style),
-            subtitle_align="right",
-            border_style=border_style,
-            box=box.ROUNDED,
-            padding=(1, 2),
-        )
         self.console.print()
-        self.console.print(panel)
+        self.console.print(
+            self._panel(
+                Group(*blocks),
+                title=self._tool_title("Tool", name, call_id, "tool.badge"),
+                subtitle=self._badge(state, state_style),
+                border_style=border_style,
+            )
+        )
 
     def handle_confirmation(self, confirmation: ToolConfirmation) -> bool:
-        output = [
+        blocks: list[Any] = [
             Text(confirmation.tool_name, style="tool"),
-            Text(confirmation.description, style="code"),
+            Text(confirmation.description, style="meta.value"),
         ]
 
         if confirmation.command:
-            output.append(Text(f"$ {confirmation.command}", style="warning"))
+            blocks.append(Text(f"$ {confirmation.command}", style="warning"))
 
         if confirmation.diff:
-            diff_text = confirmation.diff.to_diff()
-            output.append(
+            blocks.append(
                 Syntax(
-                    diff_text,
+                    confirmation.diff.to_diff(),
                     "diff",
                     theme="monokai",
                     word_wrap=True,
@@ -708,47 +780,166 @@ class TUI:
 
         self.console.print()
         self.console.print(
-            Panel(
-                Group(*output),
-                title=Text("Approval required", style="warning"),
-                title_align="left",
+            self._panel(
+                Group(*blocks),
+                title=Text.assemble(
+                    self._badge("Approval", "status.warning.badge"),
+                    (" Tool confirmation required", "warning"),
+                ),
+                subtitle=Text("y / n", style="panel.subtitle"),
                 border_style="warning",
-                box=box.ROUNDED,
-                padding=(1, 2),
             )
         )
 
         response = Prompt.ask(
-            "\nApprove?", choices=["y", "n", "yes", "no"], default="n"
+            "\nApprove?",
+            choices=["y", "n", "yes", "no"],
+            default="n",
+            console=self.console,
         )
-
         return response.lower() in {"y", "yes"}
 
+    def show_config(self) -> None:
+        self.console.print()
+        self.console.print(
+            self._panel(
+                self._kv_table(
+                    [
+                        ("Model", self.config.model_name),
+                        ("Temperature", self.config.temperature),
+                        ("Approval", self.config.approval.value),
+                        ("Working dir", self.config.cwd),
+                        ("Max turns", self.config.max_turns),
+                        ("Hooks enabled", self.config.hooks_enabled),
+                    ]
+                ),
+                title=Text.assemble(
+                    self._badge("Config", "status.info.badge"),
+                    (" Current settings", "panel.title"),
+                ),
+            )
+        )
+
+    def show_stats(self, stats: dict[str, Any]) -> None:
+        self.console.print()
+        self.console.print(
+            self._panel(
+                self._kv_table(stats.items()),
+                title=Text.assemble(
+                    self._badge("Stats", "status.info.badge"),
+                    (" Session statistics", "panel.title"),
+                ),
+            )
+        )
+
+    def show_tools(self, tools: list[Any]) -> None:
+        rows = []
+        for tool in tools:
+            rows.append((tool.name, getattr(tool.kind, "value", "tool")))
+
+        self.console.print()
+        self.console.print(
+            self._panel(
+                self._kv_table(rows) if rows else Text("No tools available", style="muted"),
+                title=Text.assemble(
+                    self._badge("Tools", "tool.badge"),
+                    (f" Available tools ({len(tools)})", "panel.title"),
+                ),
+            )
+        )
+
+    def show_mcp_servers(self, servers: list[dict[str, Any]]) -> None:
+        table = Table(expand=True, box=None, padding=(0, 1))
+        table.add_column("Server", style="meta.value")
+        table.add_column("Status", style="meta.value", no_wrap=True)
+        table.add_column("Tools", style="meta.value", justify="right")
+
+        for server in servers:
+            status = str(server.get("status", "unknown"))
+            status_style = "success" if status == "connected" else "error"
+            table.add_row(
+                str(server.get("name", "unknown")),
+                Text(status, style=status_style),
+                str(server.get("tools", 0)),
+            )
+
+        self.console.print()
+        self.console.print(
+            self._panel(
+                table if servers else Text("No MCP servers configured", style="muted"),
+                title=Text.assemble(
+                    self._badge("MCP", "status.info.badge"),
+                    (f" Servers ({len(servers)})", "panel.title"),
+                ),
+            )
+        )
+
+    def show_saved_sessions(self, sessions: list[dict[str, Any]], title_text: str) -> None:
+        table = Table(expand=True, box=None, padding=(0, 1))
+        table.add_column("ID", style="meta.value")
+        table.add_column("Turns", style="meta.value", justify="right")
+        table.add_column("Updated", style="meta.value")
+
+        for session in sessions:
+            table.add_row(
+                str(session.get("session_id", "")),
+                str(session.get("turn_count", "")),
+                str(session.get("updated_at", "")),
+            )
+
+        self.console.print()
+        self.console.print(
+            self._panel(
+                table if sessions else Text("Nothing saved yet", style="muted"),
+                title=Text.assemble(
+                    self._badge("Sessions", "status.info.badge"),
+                    (f" {title_text}", "panel.title"),
+                ),
+            )
+        )
+
     def show_help(self) -> None:
-        help_text = """
-## Commands
+        commands = Table(expand=True, box=None, padding=(0, 1))
+        commands.add_column("Command", style="meta.value", no_wrap=True)
+        commands.add_column("What it does", style="muted")
+        commands.add_row(Text("/help"), "Show this help screen")
+        commands.add_row(Text("/exit or /quit"), "Exit the agent")
+        commands.add_row(Text("/clear"), "Clear conversation history")
+        commands.add_row(Text("/config"), "Show current configuration")
+        commands.add_row(Text("/model <name>"), "Switch models")
+        commands.add_row(Text("/approval <mode>"), "Change approval mode")
+        commands.add_row(Text("/stats"), "Show session statistics")
+        commands.add_row(Text("/tools"), "List available tools")
+        commands.add_row(Text("/mcp"), "Show MCP server status")
+        commands.add_row(Text("/save"), "Save the current session")
+        commands.add_row(Text("/checkpoint [name]"), "Create a checkpoint")
+        commands.add_row(Text("/sessions"), "List saved sessions")
+        commands.add_row(Text("/resume <session_id>"), "Resume a saved session")
+        commands.add_row(Text("/restore <checkpoint_id>"), "Restore a checkpoint")
 
-- `/help` - Show this help
-- `/exit` or `/quit` - Exit the agent
-- `/clear` - Clear conversation history
-- `/config` - Show current configuration
-- `/model <name>` - Change the model
-- `/approval <mode>` - Change approval mode
-- `/stats` - Show session statistics
-- `/tools` - List available tools
-- `/mcp` - Show MCP server status
-- `/save` - Save current session
-- `/checkpoint [name]` - Create a checkpoint
-- `/checkpoints` - List available checkpoints
-- `/restore <checkpoint_id>` - Restore a checkpoint
-- `/sessions` - List saved sessions
-- `/resume <session_id>` - Resume a saved session
+        tips = self._panel(
+            Group(
+                Text("Type a normal message to start an agent run.", style="muted"),
+                Text("Press Ctrl+C to stop the current run and return to the prompt.", style="muted"),
+                Text("Tool calls, approvals, and outputs are shown as structured cards.", style="muted"),
+            ),
+            title=Text("Workflow", style="panel.title"),
+        )
 
-## Tips
-
-- Just type your message to chat with the agent
-- Press `Ctrl+C` to stop the current run and return to the prompt
-- The agent can read, write, and execute code
-- Some operations require approval (can be configured)
-"""
-        self.console.print(Markdown(help_text))
+        self.console.print()
+        self.console.print(
+            Columns(
+                [
+                    self._panel(
+                        commands,
+                        title=Text.assemble(
+                            self._badge("Help", "status.info.badge"),
+                            (" Commands", "panel.title"),
+                        ),
+                    ),
+                    tips,
+                ],
+                expand=True,
+                equal=True,
+            )
+        )
