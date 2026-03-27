@@ -12,6 +12,7 @@ class AgentEventType(str, Enum):
     AGENT_START = "agent_start"
     AGENT_END = "agent_end"
     AGENT_ERROR = "agent_error"
+    STATUS = "status"
 
     # Tool calls
     TOOL_CALL_START = "tool_call_start"
@@ -57,6 +58,13 @@ class AgentEvent:
         return cls(
             type=AgentEventType.AGENT_ERROR,
             data={"error": error, "details": details or {}},
+        )
+
+    @classmethod
+    def status(cls, message: str) -> AgentEvent:
+        return cls(
+            type=AgentEventType.STATUS,
+            data={"message": message},
         )
 
     @classmethod

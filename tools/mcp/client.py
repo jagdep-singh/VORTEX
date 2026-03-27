@@ -4,8 +4,14 @@ import os
 from pathlib import Path
 from typing import Any
 from config.config import MCPServerConfig
-from fastmcp import Client
-from fastmcp.client.transports import SSETransport, StdioTransport
+
+try:
+    from fastmcp import Client
+    from fastmcp.client.transports import SSETransport, StdioTransport
+except ModuleNotFoundError:
+    Client = None
+    SSETransport = None
+    StdioTransport = None
 
 
 class MCPServerStatus(str, Enum):
@@ -44,6 +50,11 @@ class MCPClient:
         return list(self._tools.values())
 
     def _create_transport(self) -> StdioTransport | SSETransport:
+        if Client is None or StdioTransport is None or SSETransport is None:
+            raise RuntimeError(
+                "MCP support requires the `fastmcp` package to be installed."
+            )
+
         if self.config.command:
             env = os.environ.copy()
             env.update(self.config.env)

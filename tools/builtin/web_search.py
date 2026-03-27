@@ -1,6 +1,5 @@
 from tools.base import Tool, ToolInvocation, ToolKind, ToolResult
 from pydantic import BaseModel, Field
-from ddgs import DDGS
 
 
 class WebSearchParams(BaseModel):
@@ -21,6 +20,13 @@ class WebSearchTool(Tool):
 
     async def execute(self, invocation: ToolInvocation) -> ToolResult:
         params = WebSearchParams(**invocation.params)
+
+        try:
+            from ddgs import DDGS
+        except ModuleNotFoundError:
+            return ToolResult.error_result(
+                "Web search dependency is not installed. Install `ddgs` to use this tool."
+            )
 
         try:
             results = DDGS().text(

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 from pathlib import Path
 import signal
@@ -107,6 +108,14 @@ class ShellTool(Tool):
                 process.communicate(),
                 timeout=params.timeout,
             )
+        except asyncio.CancelledError:
+            if sys.platform != "win32":
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            else:
+                process.kill()
+            await process.wait()
+            raise
         except asyncio.TimeoutError:
             if sys.platform != "win32":
                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)

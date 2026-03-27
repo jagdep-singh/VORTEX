@@ -1,15 +1,14 @@
 import asyncio
+import contextlib
 from pathlib import Path
 import sys
+
 import click
 from dotenv import load_dotenv
-import os
-from pathlib import Path
 
-workspace = Path.cwd() / "workspace"
-workspace.mkdir(exist_ok=True)
-
-os.chdir(workspace)
+PROJECT_ROOT = Path(__file__).resolve().parent
+WORKSPACE = PROJECT_ROOT / "workspace"
+WORKSPACE.mkdir(exist_ok=True)
 
 
 from agent.agent import Agent
@@ -20,7 +19,7 @@ from config.config import ApprovalPolicy, Config
 from config.loader import load_config
 from ui.tui import TUI, get_console
 
-load_dotenv()
+load_dotenv(PROJECT_ROOT / ".env")
 
 console = get_console()
 
@@ -30,6 +29,25 @@ class CLI:
         self.agent: Agent | None = None
         self.config = config
         self.tui = TUI(config, console)
+        self._active_message_task: asyncio.Task[str | None] | None = None
+
+    async def _stop_active_run(self) -> bool:
+        had_active_task = self._active_message_task is not None
+
+        if self._active_message_task and not self._active_message_task.done():
+            self._active_message_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._active_message_task
+
+        if had_active_task:
+            self._active_message_task = None
+            self.tui.clear_status()
+            console.print(
+                "\n[warning]Stopped current run. Ready for the next prompt.[/warning]"
+            )
+            return True
+
+        return False
 
     async def run_single(self, message: str) -> str | None:
         async with Agent(self.config) as agent:
@@ -43,6 +61,7 @@ class CLI:
                 f"model: {self.config.model_name}",
                 f"cwd: {self.config.cwd}",
                 "commands: /help /config /approval /model /exit",
+                "Ctrl+C: stop current run",
             ],
         )
 
@@ -64,9 +83,24 @@ class CLI:
                             break
                         continue
 
-                    await self._process_message(user_input)
+                    self._active_message_task = asyncio.create_task(
+                        self._process_message(user_input)
+                    )
+                    try:
+                        await self._active_message_task
+                    except asyncio.CancelledError:
+                        current_task = asyncio.current_task()
+                        if current_task is not None:
+                            current_task.uncancel()
+                        await self._stop_active_run()
+                    finally:
+                        self._active_message_task = None
                 except KeyboardInterrupt:
-                    console.print("\n[dim]Use /exit to quit[/dim]")
+                    stopped = await self._stop_active_run()
+                    if not stopped:
+                        console.print(
+                            "\n[dim]Press Ctrl+C to stop a run or use /exit to quit[/dim]"
+                        )
                 except EOFError:
                     break
 
@@ -89,45 +123,59 @@ class CLI:
         assistant_streaming = False
         final_response: str | None = None
 
-        async for event in self.agent.run(message):
-            if event.type == AgentEventType.TEXT_DELTA:
-                content = event.data.get("content", "")
-                if not assistant_streaming:
-                    self.tui.begin_assistant()
-                    assistant_streaming = True
-                self.tui.stream_assistant_delta(content)
-            elif event.type == AgentEventType.TEXT_COMPLETE:
-                final_response = event.data.get("content")
-                if assistant_streaming:
-                    self.tui.end_assistant()
-                    assistant_streaming = False
-            elif event.type == AgentEventType.AGENT_ERROR:
-                error = event.data.get("error", "Unknown error")
-                console.print(f"\n[error]Error: {error}[/error]")
-            elif event.type == AgentEventType.TOOL_CALL_START:
-                tool_name = event.data.get("name", "unknown")
-                tool_kind = self._get_tool_kind(tool_name)
-                self.tui.tool_call_start(
-                    event.data.get("call_id", ""),
-                    tool_name,
-                    tool_kind,
-                    event.data.get("arguments", {}),
-                )
-            elif event.type == AgentEventType.TOOL_CALL_COMPLETE:
-                tool_name = event.data.get("name", "unknown")
-                tool_kind = self._get_tool_kind(tool_name)
-                self.tui.tool_call_complete(
-                    event.data.get("call_id", ""),
-                    tool_name,
-                    tool_kind,
-                    event.data.get("success", False),
-                    event.data.get("output", ""),
-                    event.data.get("error"),
-                    event.data.get("metadata"),
-                    event.data.get("diff"),
-                    event.data.get("truncated", False),
-                    event.data.get("exit_code"),
-                )
+        try:
+            async for event in self.agent.run(message):
+                if event.type == AgentEventType.AGENT_START:
+                    self.tui.show_status("Thinking: understanding your request...")
+                elif event.type == AgentEventType.STATUS:
+                    thinking_message = event.data.get("message")
+                    if thinking_message:
+                        self.tui.show_status(thinking_message)
+                elif event.type == AgentEventType.TEXT_DELTA:
+                    content = event.data.get("content", "")
+                    if not assistant_streaming:
+                        self.tui.begin_assistant()
+                        assistant_streaming = True
+                    self.tui.stream_assistant_delta(content)
+                elif event.type == AgentEventType.TEXT_COMPLETE:
+                    final_response = event.data.get("content")
+                    if assistant_streaming:
+                        self.tui.end_assistant()
+                        assistant_streaming = False
+                    self.tui.clear_status()
+                elif event.type == AgentEventType.AGENT_ERROR:
+                    error = event.data.get("error", "Unknown error")
+                    self.tui.clear_status()
+                    console.print(f"\n[error]Error: {error}[/error]")
+                elif event.type == AgentEventType.TOOL_CALL_START:
+                    tool_name = event.data.get("name", "unknown")
+                    tool_kind = self._get_tool_kind(tool_name)
+                    self.tui.tool_call_start(
+                        event.data.get("call_id", ""),
+                        tool_name,
+                        tool_kind,
+                        event.data.get("arguments", {}),
+                    )
+                elif event.type == AgentEventType.TOOL_CALL_COMPLETE:
+                    tool_name = event.data.get("name", "unknown")
+                    tool_kind = self._get_tool_kind(tool_name)
+                    self.tui.tool_call_complete(
+                        event.data.get("call_id", ""),
+                        tool_name,
+                        tool_kind,
+                        event.data.get("success", False),
+                        event.data.get("output", ""),
+                        event.data.get("error"),
+                        event.data.get("metadata"),
+                        event.data.get("diff"),
+                        event.data.get("truncated", False),
+                        event.data.get("exit_code"),
+                    )
+        except asyncio.CancelledError:
+            if assistant_streaming:
+                self.tui.end_assistant()
+            self.tui.clear_status()
+            raise
 
         return final_response
 
@@ -330,10 +378,15 @@ def main(
     prompt: str | None,
     cwd: Path | None,
 ):
+    requested_cwd = (cwd or WORKSPACE).resolve()
+
     try:
-        config = load_config(cwd=cwd)
+        config = load_config(cwd=requested_cwd)
     except Exception as e:
         console.print(f"[error]Configuration Error: {e}[/error]")
+        sys.exit(1)
+
+    config.cwd = requested_cwd
 
     errors = config.validate()
 
@@ -354,4 +407,5 @@ def main(
         asyncio.run(cli.run_interactive())
 
 
-main()
+if __name__ == "__main__":
+    main()

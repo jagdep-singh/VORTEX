@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 import json
@@ -50,7 +50,7 @@ class ToolCallDelta:
 class ToolCall:
     call_id: str
     name: str | None = None
-    arguments: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

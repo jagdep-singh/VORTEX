@@ -17,14 +17,16 @@ from config.config import Config
 class LLMClient:
     def __init__(self, config: Config) -> None:
         self._client: AsyncOpenAI | None = None
-        self._max_retries: int = 3
+        self._max_retries: int = 1
         self.config = config
 
     def get_client(self) -> AsyncOpenAI:
         if self._client is None:
             self._client = AsyncOpenAI(
-                api_key=self.config.api_key,  # "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"
-                base_url=self.config.base_url,  # "https://openrouter.ai/api/v1"
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+                timeout=30.0,
+                max_retries=0,
             )
         return self._client
 
@@ -64,6 +66,7 @@ class LLMClient:
             "model": self.config.model_name,
             "messages": messages,
             "stream": stream,
+            "temperature": self.config.temperature,
         }
 
         if tools:
@@ -96,13 +99,22 @@ class LLMClient:
                 else:
                     yield StreamEvent(
                         type=StreamEventType.ERROR,
-                        error=f"Connection error: {e}",
+                        error=(
+                            f"Connection error: {e}. "
+                            "Check your internet connection and BASE_URL/API settings."
+                        ),
                     )
                     return
             except APIError as e:
                 yield StreamEvent(
                     type=StreamEventType.ERROR,
                     error=f"API error: {e}",
+                )
+                return
+            except Exception as e:
+                yield StreamEvent(
+                    type=StreamEventType.ERROR,
+                    error=f"Unexpected client error: {e}",
                 )
                 return
 
@@ -152,30 +164,35 @@ class LLMClient:
                             "arguments": "",
                         }
 
-                        if tool_call_delta.function:
-                            if tool_call_delta.function.name:
-                                tool_calls[idx]["name"] = tool_call_delta.function.name
-                                yield StreamEvent(
-                                    type=StreamEventType.TOOL_CALL_START,
-                                    tool_call_delta=ToolCallDelta(
-                                        call_id=tool_calls[idx]["id"],
-                                        name=tool_call_delta.function.name,
-                                    ),
-                                )
+                    tool_call = tool_calls[idx]
 
-                        if tool_call_delta.function.arguments:
-                            tool_calls[idx][
-                                "arguments"
-                            ] += tool_call_delta.function.arguments
+                    if tool_call_delta.id:
+                        tool_call["id"] = tool_call_delta.id
 
+                    function = tool_call_delta.function
+                    if function and function.name:
+                        is_new_name = not tool_call["name"]
+                        tool_call["name"] = function.name
+                        if is_new_name:
                             yield StreamEvent(
-                                type=StreamEventType.TOOL_CALL_DELTA,
+                                type=StreamEventType.TOOL_CALL_START,
                                 tool_call_delta=ToolCallDelta(
-                                    call_id=tool_calls[idx]["id"],
-                                    name=tool_call_delta.function.name,
-                                    arguments_delta=tool_call_delta.function.arguments,
+                                    call_id=tool_call["id"],
+                                    name=function.name,
                                 ),
                             )
+
+                    if function and function.arguments:
+                        tool_call["arguments"] += function.arguments
+
+                        yield StreamEvent(
+                            type=StreamEventType.TOOL_CALL_DELTA,
+                            tool_call_delta=ToolCallDelta(
+                                call_id=tool_call["id"],
+                                name=tool_call["name"],
+                                arguments_delta=function.arguments,
+                            ),
+                        )
 
         for idx, tc in tool_calls.items():
             yield StreamEvent(

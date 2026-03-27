@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 from typing import AsyncGenerator, Callable
 from agent.events import AgentEvent, AgentEventType
 from agent.session import Session
@@ -42,6 +43,7 @@ class Agent:
             response_text = ""
 
             if self.session.context_manager.needs_compression():
+                yield AgentEvent.status("Thinking: compacting earlier context...")
                 summary, usage = await self.session.chat_compactor.compress(
                     self.session.context_manager
                 )
@@ -55,6 +57,11 @@ class Agent:
 
             tool_calls: list[ToolCall] = []
             usage: TokenUsage | None = None
+
+            if turn_num == 0:
+                yield AgentEvent.status("Thinking: planning the next step...")
+            else:
+                yield AgentEvent.status("Thinking: reviewing the latest results...")
 
             async for event in self.session.client.chat_completion(
                 self.session.context_manager.get_messages(),
@@ -84,7 +91,7 @@ class Agent:
                             "type": "function",
                             "function": {
                                 "name": tc.name,
-                                "arguments": str(tc.arguments),
+                                "arguments": json.dumps(tc.arguments),
                             },
                         }
                         for tc in tool_calls
@@ -100,15 +107,22 @@ class Agent:
                     "response",
                     text=response_text,
                 )
+                loop_description = self.session.loop_detector.check_for_loop()
+                if loop_description:
+                    yield AgentEvent.agent_error(
+                        f"Stopped to avoid a loop: {loop_description}"
+                    )
+                    return
+
+            if usage:
+                self.session.context_manager.set_latest_usage(usage)
+                self.session.context_manager.add_usage(usage)
 
             if not tool_calls:
-                if usage:
-                    self.session.context_manager.set_latest_usage(usage)
-                    self.session.context_manager.add_usage(usage)
-
                 self.session.context_manager.prune_tool_outputs()
                 return
 
+            yield AgentEvent.status("Thinking: choosing a tool to move forward...")
             for tool_call in tool_calls:
                 yield AgentEvent.tool_call_start(
                     tool_call.call_id,
@@ -121,6 +135,12 @@ class Agent:
                     tool_name=tool_call.name,
                     args=tool_call.arguments,
                 )
+                loop_description = self.session.loop_detector.check_for_loop()
+                if loop_description:
+                    yield AgentEvent.agent_error(
+                        f"Stopped to avoid a loop: {loop_description}"
+                    )
+                    return
 
                 result = await self.session.tool_registry.invoke(
                     tool_call.name,
@@ -136,8 +156,18 @@ class Agent:
                     result,
                 )
 
-                # EXIT AFTER TOOL RUNS — prevents second LLM call
-                return
+                tool_result_message = ToolResultMessage(
+                    tool_call_id=tool_call.call_id,
+                    content=result.to_model_output(),
+                    is_error=not result.success,
+                )
+                self.session.context_manager.add_tool_result(
+                    tool_result_message.tool_call_id,
+                    tool_result_message.content,
+                )
+
+            yield AgentEvent.status("Thinking: reviewing tool output...")
+            continue
 
         yield AgentEvent.agent_error(f"Maximum turns ({max_turns}) reached")
 

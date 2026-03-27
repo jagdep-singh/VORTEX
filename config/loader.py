@@ -2,7 +2,10 @@ from pathlib import Path
 from typing import Any
 
 from platformdirs import user_config_dir, user_data_dir
-import tomli
+try:
+    import tomllib as tomli
+except ModuleNotFoundError:
+    import tomli
 
 from config.config import Config
 from utils.errors import ConfigError

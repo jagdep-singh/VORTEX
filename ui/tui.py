@@ -27,11 +27,14 @@ AGENT_THEME = Theme(
         "success": "green",
         "dim": "dim",
         "muted": "grey50",
+        "thinking": "italic grey62",
         "border": "grey35",
         "highlight": "bold cyan",
         # Roles
         "user": "bright_blue bold",
         "assistant": "bright_white",
+        "assistant.inline_code": "bold bright_white on grey23",
+        "assistant.code_block": "white on grey11",
         # Tools
         "tool": "bright_magenta bold",
         "tool.read": "cyan",
@@ -68,19 +71,149 @@ class TUI:
         self.config = config
         self.cwd = self.config.cwd
         self._max_block_tokens = 2500
+        self._last_status: str | None = None
+        self._assistant_mode = "text"
+        self._assistant_pending_backticks = ""
+        self._assistant_fence_header_pending = False
 
     def begin_assistant(self) -> None:
         self.console.print()
         self.console.print(Rule(Text("Assistant", style="assistant")))
         self._assistant_stream_open = True
+        self._assistant_mode = "text"
+        self._assistant_pending_backticks = ""
+        self._assistant_fence_header_pending = False
 
     def end_assistant(self) -> None:
+        self._finalize_assistant_pending_backticks()
         if self._assistant_stream_open:
             self.console.print()
         self._assistant_stream_open = False
+        self._assistant_mode = "text"
+        self._assistant_pending_backticks = ""
+        self._assistant_fence_header_pending = False
+
+    def _assistant_text_style(self) -> str:
+        if self._assistant_mode == "inline_code":
+            return "assistant.inline_code"
+        if self._assistant_mode == "fenced_code":
+            return "assistant.code_block"
+        return "assistant"
+
+    def _flush_assistant_pending_backticks(self) -> None:
+        if not self._assistant_pending_backticks:
+            return
+
+        style = self._assistant_text_style()
+        self.console.print(
+            Text(self._assistant_pending_backticks, style=style),
+            end="",
+        )
+        self._assistant_pending_backticks = ""
+
+    def _finalize_assistant_pending_backticks(self) -> None:
+        if not self._assistant_pending_backticks:
+            return
+
+        tick_count = len(self._assistant_pending_backticks)
+
+        if tick_count == 1 and self._assistant_mode == "inline_code":
+            self._assistant_pending_backticks = ""
+            self._assistant_mode = "text"
+            return
+
+        if tick_count >= 3 and self._assistant_mode == "fenced_code":
+            self._assistant_pending_backticks = ""
+            self._assistant_mode = "text"
+            self._assistant_fence_header_pending = False
+            return
+
+        self._flush_assistant_pending_backticks()
 
     def stream_assistant_delta(self, content: str) -> None:
-        self.console.print(content, end="", markup=False)
+        text = f"{self._assistant_pending_backticks}{content}"
+        self._assistant_pending_backticks = ""
+
+        rendered = Text()
+        segment_buffer: list[str] = []
+        segment_style = self._assistant_text_style()
+
+        def flush_segment() -> None:
+            nonlocal segment_buffer, segment_style
+            if segment_buffer:
+                rendered.append("".join(segment_buffer), style=segment_style)
+                segment_buffer = []
+
+        i = 0
+        while i < len(text):
+            char = text[i]
+
+            if self._assistant_fence_header_pending:
+                if char == "\n":
+                    self._assistant_fence_header_pending = False
+                    new_style = self._assistant_text_style()
+                    if new_style != segment_style:
+                        flush_segment()
+                        segment_style = new_style
+                    segment_buffer.append(char)
+                i += 1
+                continue
+
+            if char == "`":
+                run_end = i
+                while run_end < len(text) and text[run_end] == "`":
+                    run_end += 1
+
+                tick_run = text[i:run_end]
+                if run_end == len(text):
+                    self._assistant_pending_backticks = tick_run
+                    break
+
+                flush_segment()
+
+                if len(tick_run) >= 3 and self._assistant_mode != "inline_code":
+                    if self._assistant_mode == "fenced_code":
+                        self._assistant_mode = "text"
+                    else:
+                        self._assistant_mode = "fenced_code"
+                        self._assistant_fence_header_pending = True
+                    segment_style = self._assistant_text_style()
+                elif len(tick_run) == 1 and self._assistant_mode != "fenced_code":
+                    if self._assistant_mode == "inline_code":
+                        self._assistant_mode = "text"
+                    else:
+                        self._assistant_mode = "inline_code"
+                    segment_style = self._assistant_text_style()
+                else:
+                    literal_style = self._assistant_text_style()
+                    rendered.append(tick_run, style=literal_style)
+                    segment_style = self._assistant_text_style()
+
+                i = run_end
+                continue
+
+            new_style = self._assistant_text_style()
+            if new_style != segment_style:
+                flush_segment()
+                segment_style = new_style
+            segment_buffer.append(char)
+            i += 1
+
+        flush_segment()
+
+        if rendered:
+            self.console.print(rendered, end="")
+
+    def show_status(self, message: str) -> None:
+        if message == self._last_status:
+            return
+
+        self.console.print()
+        self.console.print(Text(message, style="thinking"))
+        self._last_status = message
+
+    def clear_status(self) -> None:
+        self._last_status = None
 
     def _ordered_args(self, tool_name: str, args: dict[str, Any]) -> list[tuple]:
         _PREFERRED_ORDER = {
@@ -614,6 +747,7 @@ class TUI:
 ## Tips
 
 - Just type your message to chat with the agent
+- Press `Ctrl+C` to stop the current run and return to the prompt
 - The agent can read, write, and execute code
 - Some operations require approval (can be configured)
 """
