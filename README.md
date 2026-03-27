@@ -106,6 +106,26 @@ Build the image:
 docker build -t jazz-code .
 ```
 
+Compose build:
+
+```bash
+docker compose build
+```
+
+Start with Compose:
+
+```bash
+docker compose up --build
+```
+
+For this specific project, `docker compose run --rm jazz-code` is usually the better choice because Jazz-Code is an interactive terminal app rather than a background service.
+
+Interactive Compose run:
+
+```bash
+docker compose run --rm jazz-code
+```
+
 Run it against the current directory as the working project:
 
 ```bash

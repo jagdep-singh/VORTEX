@@ -1,0 +1,16 @@
+services:
+  jazz-code:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jazz-code:latest
+    stdin_open: true
+    tty: true
+    env_file:
+      - .env
+    volumes:
+      - .:/workspace
+      - jazz-code-data:/data
+
+volumes:
+  jazz-code-data:
