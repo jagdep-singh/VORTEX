@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -20,47 +21,57 @@ from tools.base import ToolConfirmation
 from utils.paths import display_path_rel_to_cwd
 from utils.text import truncate_text
 
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.formatted_text import FormattedText
+    from prompt_toolkit.history import InMemoryHistory
+except Exception:
+    PromptSession = None
+    FormattedText = None
+    InMemoryHistory = None
+
 AGENT_THEME = Theme(
     {
-        "info": "bright_cyan",
-        "warning": "yellow",
-        "error": "bright_red bold",
-        "success": "green",
-        "muted": "grey58",
-        "dim": "grey42",
-        "surface": "grey11",
-        "surface.alt": "grey15",
-        "panel.border": "grey27",
-        "panel.title": "bold bright_cyan",
-        "panel.subtitle": "grey58",
-        "brand": "bold bright_cyan",
-        "brand.badge": "bold black on bright_cyan",
-        "chip": "bold black on grey70",
-        "prompt": "bold bright_cyan",
-        "prompt.hint": "grey58",
-        "user": "bright_blue bold",
-        "user.badge": "bold black on bright_blue",
-        "assistant": "bright_white",
-        "assistant.badge": "bold black on bright_cyan",
-        "assistant.inline_code": "bold bright_white on grey23",
-        "assistant.code_block": "white on grey11",
-        "thinking": "italic grey70",
-        "thinking.badge": "bold black on grey78",
-        "meta.label": "grey58",
-        "meta.value": "bright_white",
-        "tool": "bold bright_magenta",
-        "tool.badge": "bold black on bright_magenta",
-        "tool.read": "cyan",
-        "tool.write": "yellow",
-        "tool.shell": "magenta",
-        "tool.network": "bright_blue",
-        "tool.memory": "green",
-        "tool.mcp": "bright_cyan",
-        "status.info.badge": "bold black on bright_cyan",
-        "status.success.badge": "bold black on green",
-        "status.warning.badge": "bold black on yellow",
-        "status.error.badge": "bold white on bright_red",
-        "code": "bright_white",
+        "info": "#00e5e5",
+        "warning": "#ffd166",
+        "error": "bold #ff6b6b",
+        "success": "#00e5e5",
+        "muted": "#555555",
+        "dim": "#333333",
+        "surface": "#0d0d0d",
+        "surface.alt": "#121212",
+        "panel.border": "#1a1a1a",
+        "panel.title": "bold #00e5e5",
+        "panel.subtitle": "#555555",
+        "brand": "bold #00e5e5",
+        "brand.badge": "bold #00e5e5",
+        "chip": "#00e5e5",
+        "chip.border": "#1a4a4a",
+        "prompt": "#00e5e5",
+        "prompt.hint": "#555555",
+        "user": "#c9c9c9",
+        "user.badge": "#555555",
+        "assistant": "#c9c9c9",
+        "assistant.badge": "#00e5e5",
+        "assistant.inline_code": "bold #00e5e5",
+        "assistant.code_block": "#c9c9c9 on #121212",
+        "thinking": "italic #777777",
+        "thinking.badge": "#00e5e5",
+        "meta.label": "#00e5e5",
+        "meta.value": "#c9c9c9",
+        "tool": "bold #00e5e5",
+        "tool.badge": "#00e5e5",
+        "tool.read": "#00e5e5",
+        "tool.write": "#ffd166",
+        "tool.shell": "#c678dd",
+        "tool.network": "#61afef",
+        "tool.memory": "#98c379",
+        "tool.mcp": "#00e5e5",
+        "status.info.badge": "#00e5e5",
+        "status.success.badge": "#00e5e5",
+        "status.warning.badge": "#ffd166",
+        "status.error.badge": "#ff6b6b",
+        "code": "#c9c9c9",
     }
 )
 
@@ -75,6 +86,17 @@ def get_console() -> Console:
 
 
 class TUI:
+    _LOGO = "\n".join(
+        [
+            "     ██╗ █████╗ ███████╗███████╗       ██████╗ ██████╗ ██████╗ ███████╗",
+            "     ██║██╔══██╗╚══███╔╝╚══███╔╝      ██╔════╝██╔═══██╗██╔══██╗██╔════╝",
+            "     ██║███████║  ███╔╝   ███╔╝ █████╗██║     ██║   ██║██║  ██║█████╗",
+            "██   ██║██╔══██║ ███╔╝   ███╔╝  ╚════╝██║     ██║   ██║██║  ██║██╔══╝",
+            "╚█████╔╝██║  ██║███████╗███████╗      ╚██████╗╚██████╔╝██████╔╝███████╗",
+            " ╚════╝ ╚═╝  ╚═╝╚══════╝╚══════╝       ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝",
+        ]
+    )
+
     def __init__(
         self,
         config: Config,
@@ -90,17 +112,43 @@ class TUI:
         self._tool_args_by_call_id: dict[str, dict[str, Any]] = {}
         self._max_block_tokens = 2500
         self._last_status: str | None = None
+        self._prompt_session = None
+
+        if (
+            PromptSession is not None
+            and InMemoryHistory is not None
+            and sys.stdin.isatty()
+            and sys.stdout.isatty()
+        ):
+            self._prompt_session = PromptSession(
+                history=InMemoryHistory(),
+            )
 
     def _badge(self, label: str, style: str) -> Text:
         return Text(f" {label.upper()} ", style=style)
 
-    def _chip_row(self, items: Iterable[str]) -> Text:
-        text = Text()
-        for index, item in enumerate(items):
-            if index:
-                text.append(" ")
-            text.append_text(self._badge(item, "chip"))
+    def _home_relative(self, path: str | Path) -> str:
+        text = str(path)
+        home = str(Path.home())
+        if text.startswith(home):
+            return text.replace(home, "~", 1)
         return text
+
+    def _command_pills(self, items: Iterable[str]) -> Columns:
+        return Columns(
+            [
+                Panel.fit(
+                    Text(item, style="chip"),
+                    border_style="chip.border",
+                    box=box.ROUNDED,
+                    padding=(0, 1),
+                )
+                for item in items
+            ],
+            expand=False,
+            equal=False,
+            padding=(0, 1),
+        )
 
     def _section_title(self, label: str, badge_style: str, title_style: str) -> Text:
         title = Text()
@@ -149,62 +197,80 @@ class TUI:
         return Text(" • ".join(clean_parts), style=style)
 
     def prompt(self) -> str:
-        return "\n[user.badge] YOU [/user.badge] [prompt]›[/prompt] "
+        return "\n[prompt]⬡[/prompt] [prompt.hint]you › [/prompt.hint]"
+
+    def _prompt_message(self):
+        if FormattedText is None:
+            return None
+
+        return FormattedText(
+            [
+                ("", "\n"),
+                ("fg:#00e5e5", "⬡ "),
+                ("fg:#555555", "you › "),
+            ]
+        )
+
+    async def read_prompt(self) -> str:
+        if self._prompt_session is not None:
+            return await self._prompt_session.prompt_async(
+                self._prompt_message(),
+                mouse_support=False,
+            )
+
+        return self.console.input(self.prompt())
 
     def print_welcome(self) -> None:
-        header = Text()
-        header.append_text(self._badge("Jazz-Code", "brand.badge"))
-        header.append(" ")
-        header.append("Agent Console", style="brand")
+        workspace = self._home_relative(self.config.cwd)
+        rows = [
+            ("model", self.config.model_name),
+            ("workspace", workspace),
+            ("approval", self.config.approval.value),
+            ("turns", f"{self.config.max_turns} max"),
+        ]
 
-        subtitle = Text(
-            "A local coding shell with streaming replies, tool execution, approvals, and session controls.",
-            style="muted",
-        )
+        value_width = max(len(value) for _, value in rows)
+        inner_width = max(62, 13 + value_width)
+        top = Text(f"┌─ session {'─' * (inner_width - 12)}┐", style="dim")
+        bottom = Text(f"└{'─' * inner_width}┘", style="dim")
 
-        overview = self._panel(
-            self._kv_table(
-                [
-                    ("Model", self.config.model_name),
-                    ("Workspace", self.config.cwd),
-                    ("Approval", self.config.approval.value),
-                    ("Max turns", self.config.max_turns),
-                ]
-            ),
-            title=Text("Session", style="panel.title"),
-        )
-
-        controls = self._panel(
-            Group(
-                self._chip_row(["/help", "/config", "/approval", "/model", "/exit"]),
-                Text(""),
-                Text("Ctrl+C stops the current run without quitting.", style="muted"),
-                Text("Type a prompt to start working in the current workspace.", style="muted"),
-            ),
-            title=Text("Controls", style="panel.title"),
-        )
-
-        body = Group(
-            header,
-            subtitle,
-            Text(""),
-            Columns([overview, controls], expand=True, equal=True),
-        )
+        session_lines: list[Text] = [top]
+        for label, value in rows:
+            line = Text("│  ", style="dim")
+            line.append(f"{label:<9}", style="meta.label")
+            line.append(f" {value:<{inner_width - 13}}", style="meta.value")
+            line.append("│", style="dim")
+            session_lines.append(line)
+        session_lines.append(bottom)
 
         self.console.print()
+        self.console.print(Text(self._LOGO, style="brand"))
         self.console.print(
-            self._panel(
-                body,
-                title=Text("Terminal UI", style="panel.title"),
-                subtitle=Text("ready", style="panel.subtitle"),
+            Text(
+                "─── A LOCAL CODING AGENT  ·  STREAMING  ·  TOOLS  ·  APPROVALS ───",
+                style="muted",
             )
+        )
+        self.console.print()
+        for line in session_lines:
+            self.console.print(line)
+        self.console.print()
+        self.console.print(Text("commands", style="muted"))
+        self.console.print(
+            self._command_pills(
+                ["/help", "/config", "/models", "/approval", "/model", "/exit"]
+            )
+        )
+        self.console.print()
+        self.console.print(
+            Text("Ctrl+C to stop current run · stay in session", style="muted")
         )
 
     def begin_assistant(self) -> None:
         title = Text()
-        title.append_text(self._badge("Assistant", "assistant.badge"))
-        title.append(" ")
-        title.append("Jazz-Code", style="assistant")
+        title.append("assistant", style="muted")
+        title.append(" · ", style="dim")
+        title.append("Jazz-Code", style="assistant.badge")
 
         self.console.print()
         self.console.print(Rule(title, style="panel.border"))
@@ -343,8 +409,8 @@ class TUI:
                 detail = suffix.strip() or prefix.strip()
 
         line = Text()
-        line.append_text(self._badge(label, "thinking.badge"))
-        line.append(" ")
+        line.append("⬡ ", style="thinking.badge")
+        line.append(f"{label.lower()} › ", style="muted")
         line.append(detail, style="thinking")
 
         self.console.print()
@@ -355,12 +421,6 @@ class TUI:
         self._last_status = None
 
     def show_notice(self, message: str, level: str = "info") -> None:
-        badge_style = {
-            "info": "status.info.badge",
-            "success": "status.success.badge",
-            "warning": "status.warning.badge",
-            "error": "status.error.badge",
-        }.get(level, "status.info.badge")
         text_style = {
             "info": "info",
             "success": "success",
@@ -369,8 +429,8 @@ class TUI:
         }.get(level, "info")
 
         line = Text()
-        line.append_text(self._badge(level, badge_style))
-        line.append(" ")
+        line.append("⬡ ", style="thinking.badge")
+        line.append(f"{level} › ", style="muted")
         line.append(message, style=text_style)
         self.console.print()
         self.console.print(line)
@@ -800,22 +860,74 @@ class TUI:
         return response.lower() in {"y", "yes"}
 
     def show_config(self) -> None:
+        base_url = self.config.base_url or "default"
         self.console.print()
         self.console.print(
             self._panel(
                 self._kv_table(
                     [
                         ("Model", self.config.model_name),
+                        (
+                            "Active profile",
+                            self.config.active_model_profile or "default",
+                        ),
+                        ("Base URL", base_url),
+                        ("API key source", self.config.api_key_source_label),
                         ("Temperature", self.config.temperature),
                         ("Approval", self.config.approval.value),
                         ("Working dir", self.config.cwd),
                         ("Max turns", self.config.max_turns),
+                        ("Configured profiles", len(self.config.models)),
                         ("Hooks enabled", self.config.hooks_enabled),
                     ]
                 ),
                 title=Text.assemble(
                     self._badge("Config", "status.info.badge"),
                     (" Current settings", "panel.title"),
+                ),
+            )
+        )
+
+    def show_model_profiles(self, config: Config) -> None:
+        table = Table(expand=True, box=None, padding=(0, 1))
+        table.add_column("Name", style="meta.value")
+        table.add_column("Model", style="meta.value")
+        table.add_column("Base URL", style="muted")
+        table.add_column("Key source", style="muted")
+        table.add_column("Active", style="meta.value", no_wrap=True)
+
+        profiles = config.list_model_profiles()
+        for name, profile in profiles:
+            table.add_row(
+                name,
+                profile.model.name,
+                profile.base_url or "default",
+                profile.key_source_label,
+                "yes" if config.active_model_profile == name else "",
+            )
+
+        if not profiles:
+            body = Group(
+                Text("No custom model profiles configured yet.", style="muted"),
+                Text(
+                    "Add them in .ai-agent/config.toml under [models.<name>].",
+                    style="muted",
+                ),
+            )
+        else:
+            body = table
+
+        self.console.print()
+        self.console.print(
+            self._panel(
+                body,
+                title=Text.assemble(
+                    self._badge("Models", "status.info.badge"),
+                    (f" Configured profiles ({len(profiles)})", "panel.title"),
+                ),
+                subtitle=Text(
+                    f"active: {config.active_model_profile or 'default'}",
+                    style="panel.subtitle",
                 ),
             )
         )
@@ -906,7 +1018,8 @@ class TUI:
         commands.add_row(Text("/exit or /quit"), "Exit the agent")
         commands.add_row(Text("/clear"), "Clear conversation history")
         commands.add_row(Text("/config"), "Show current configuration")
-        commands.add_row(Text("/model <name>"), "Switch models")
+        commands.add_row(Text("/models"), "List configured model profiles")
+        commands.add_row(Text("/model <name>"), "Switch profile or change model name")
         commands.add_row(Text("/approval <mode>"), "Change approval mode")
         commands.add_row(Text("/stats"), "Show session statistics")
         commands.add_row(Text("/tools"), "List available tools")
@@ -922,6 +1035,10 @@ class TUI:
                 Text("Type a normal message to start an agent run.", style="muted"),
                 Text("Press Ctrl+C to stop the current run and return to the prompt.", style="muted"),
                 Text("Tool calls, approvals, and outputs are shown as structured cards.", style="muted"),
+                Text(
+                    "Add custom providers in .ai-agent/config.toml with [models.<name>].",
+                    style="muted",
+                ),
             ),
             title=Text("Workflow", style="panel.title"),
         )

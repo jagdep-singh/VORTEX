@@ -71,9 +71,36 @@ An AI agent that can execute tasks using tools and manage conversations.
 - Developer and user instructions
 - Shell environment policies
 - MCP server configuration
+- Named model profiles with custom `base_url` and API key sources
 
 ### User Interface
 
 - Terminal UI with formatted output
-- Command interface: /help, /config, /tools, /mcp, /stats, /save, /resume, /checkpoint, /restore
+- Command interface: /help, /config, /models, /model, /tools, /mcp, /stats, /save, /resume, /checkpoint, /restore
 - Real-time tool call visualization
+
+## Custom Model Profiles
+
+You can define your own provider-backed models in `.ai-agent/config.toml`:
+
+```toml
+active_model_profile = "openrouter"
+
+[models.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[models.openrouter.model]
+name = "nvidia/nemotron-3-super-120b-a12b:free"
+temperature = 0
+
+[models.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[models.openai.model]
+name = "gpt-4.1-mini"
+temperature = 0.2
+```
+
+Then use `/models` to list them and `/model <profile-name>` to switch between them at runtime.

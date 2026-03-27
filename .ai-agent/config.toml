@@ -20,3 +20,23 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/rivaanranawat/D
 [mcp_servers.filesystem2]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem222222222222", "/Users/rivaanranawat/Desktop/ai-agent", "/tmp"]
+
+# Example custom model profiles:
+#
+# active_model_profile = "openrouter"
+#
+# [models.openrouter]
+# base_url = "https://openrouter.ai/api/v1"
+# api_key_env = "OPENROUTER_API_KEY"
+#
+# [models.openrouter.model]
+# name = "nvidia/nemotron-3-super-120b-a12b:free"
+# temperature = 0
+#
+# [models.openai]
+# base_url = "https://api.openai.com/v1"
+# api_key_env = "OPENAI_API_KEY"
+#
+# [models.openai.model]
+# name = "gpt-4.1-mini"
+# temperature = 0.2

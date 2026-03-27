@@ -31,6 +31,10 @@ class CLI:
         self.tui = TUI(config, console)
         self._active_message_task: asyncio.Task[str | None] | None = None
 
+    async def _reset_model_client(self) -> None:
+        if self.agent and self.agent.session and self.agent.session.client:
+            await self.agent.session.client.close()
+
     async def _stop_active_run(self) -> bool:
         had_active_task = self._active_message_task is not None
 
@@ -66,7 +70,7 @@ class CLI:
 
             while True:
                 try:
-                    user_input = console.input(self.tui.prompt()).strip()
+                    user_input = (await self.tui.read_prompt()).strip()
                     if not user_input:
                         continue
 
@@ -184,16 +188,52 @@ class CLI:
             self.tui.show_notice("Conversation cleared.", level="success")
         elif command == "/config":
             self.tui.show_config()
+        elif cmd_name == "/models":
+            self.tui.show_model_profiles(self.config)
         elif cmd_name == "/model":
             if cmd_args:
-                self.config.model_name = cmd_args
-                self.tui.show_notice(
-                    f"Model changed to: {cmd_args}",
-                    level="success",
-                )
+                target = cmd_args.strip()
+                profile_name = None
+
+                if target.startswith("use "):
+                    profile_name = target[4:].strip()
+                elif target in self.config.models:
+                    profile_name = target
+
+                if profile_name:
+                    try:
+                        self.config.switch_model_profile(profile_name)
+                        await self._reset_model_client()
+                        if self.config.api_key:
+                            self.tui.show_notice(
+                                f"Switched to model profile: {profile_name} "
+                                f"({self.config.model_name})",
+                                level="success",
+                            )
+                        else:
+                            self.tui.show_notice(
+                                f"Switched to profile '{profile_name}', but no API key "
+                                "is currently resolved for it.",
+                                level="warning",
+                            )
+                    except ValueError as exc:
+                        self.tui.show_notice(str(exc), level="error")
+                else:
+                    self.config.model_name = target
+                    await self._reset_model_client()
+                    self.tui.show_notice(
+                        f"Model changed to: {target}",
+                        level="success",
+                    )
             else:
                 self.tui.show_notice(
-                    f"Current model: {self.config.model_name}",
+                    "Current model: "
+                    f"{self.config.model_name}"
+                    + (
+                        f" via profile '{self.config.active_model_profile}'"
+                        if self.config.active_model_profile
+                        else ""
+                    ),
                     level="info",
                 )
         elif cmd_name == "/approval":
