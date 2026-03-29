@@ -47,3 +47,4 @@ stepfun/step-3.5-flash
 arcee-ai/trinity-large-preview:free
 moonshotai/kimi-k2.5
 upstage/solar-pro-3
+arcee-ai/trinity-large-preview:free
