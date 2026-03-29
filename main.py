@@ -186,6 +186,13 @@ class CLI:
             self.agent.session.context_manager.clear()
             self.agent.session.loop_detector.clear()
             self.tui.show_notice("Conversation cleared.", level="success")
+        elif command == "/scan":
+            snapshot, code_index = self.agent.session.refresh_workspace_context()
+            self.tui.show_workspace_snapshot(snapshot)
+            self.tui.show_code_index(code_index)
+        elif command == "/index":
+            summary = self.agent.session.refresh_code_index()
+            self.tui.show_code_index(summary)
         elif command == "/config":
             self.tui.show_config()
         elif cmd_name == "/models":

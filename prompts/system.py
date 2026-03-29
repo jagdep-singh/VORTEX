@@ -8,6 +8,8 @@ def get_system_prompt(
     config: Config,
     user_memory: str | None = None,
     tools: list[Tool] | None = None,
+    workspace_snapshot: str | None = None,
+    code_index_summary: str | None = None,
 ) -> str:
     parts = []
 
@@ -15,6 +17,10 @@ def get_system_prompt(
     parts.append(_get_identity_section())
     # Environment
     parts.append(_get_environment_section(config))
+    if workspace_snapshot:
+        parts.append(_get_workspace_snapshot_section(workspace_snapshot))
+    if code_index_summary:
+        parts.append(_get_code_index_section(code_index_summary))
 
     if tools:
         parts.append(_get_tool_guidelines_section(tools))
@@ -67,6 +73,26 @@ def _get_environment_section(config: Config) -> str:
 - **Shell**: {_get_shell_info()}
 
 The user has granted you access to run tools in service of their request. Use them when needed."""
+
+
+def _get_workspace_snapshot_section(workspace_snapshot: str) -> str:
+    return f"""# Workspace Snapshot
+
+The harness generated the following compact snapshot of the current working directory to help you orient quickly:
+
+{workspace_snapshot}
+
+Treat this as a high-level map only. Before editing or relying on exact contents, use file tools like `read_file`, `grep`, `glob`, and `list_dir` to verify details."""
+
+
+def _get_code_index_section(code_index_summary: str) -> str:
+    return f"""# Codebase Index
+
+The harness also generated a lightweight symbol index over source files in the workspace:
+
+{code_index_summary}
+
+Use this index to orient yourself quickly. When you need exact locations for a function, class, type, struct, or macro, prefer the `find_symbol` tool before falling back to broader searches."""
 
 
 def _get_shell_info() -> str:

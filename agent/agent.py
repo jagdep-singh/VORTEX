@@ -21,6 +21,7 @@ class Agent:
 
     async def run(self, message: str):
         await self.session.hook_system.trigger_before_agent(message)
+        self.session.refresh_workspace_context()
         yield AgentEvent.agent_start(message)
         self.session.context_manager.add_user_message(message)
 

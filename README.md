@@ -9,6 +9,8 @@ It is designed to run against a working directory on your machine, stream model 
 - Runs in interactive mode or single-prompt mode
 - Streams assistant output and tool execution in a custom terminal UI
 - Lets the model call local tools such as file read/write/edit, search, shell, and memory
+- Builds a compact workspace snapshot so the agent starts with project context
+- Builds a lightweight symbol index so the agent can reason about functions, classes, structs, and types
 - Supports approval policies for risky or mutating actions
 - Saves sessions and checkpoints
 - Loads extra tools from `.ai-agent/tools`
@@ -236,6 +238,8 @@ The terminal command set currently includes:
 - `/exit`
 - `/quit`
 - `/clear`
+- `/scan`
+- `/index`
 - `/config`
 - `/models`
 - `/model <name>`
@@ -255,6 +259,21 @@ Useful interaction behavior:
 - arrow keys work in the input prompt through `prompt_toolkit`
 - assistant output streams live
 - tool calls are rendered as structured terminal cards
+- the agent refreshes a compact workspace snapshot at the start of each run
+- the agent also refreshes a lightweight codebase index and exposes it through `/index` and `find_symbol`
+
+## Codebase Index
+
+Jazz-Code now includes a lightweight source-code index that extracts symbols from common languages such as Python, C, C++, JavaScript, TypeScript, Go, Rust, and Java.
+
+This gives the agent a faster way to orient itself around a project:
+
+- a compact symbol summary is injected into the system prompt
+- `/scan` refreshes and shows the current workspace snapshot
+- `/index` shows the current symbol index in the TUI
+- the built-in `find_symbol` tool can look up functions, classes, structs, enums, interfaces, types, traits, and macros by name
+
+This is intentionally heuristic and lightweight. It is not a full language server, but it gives the agent a much better structural map of the workspace than plain file listing alone.
 
 ## Approval Modes
 
@@ -278,6 +297,7 @@ Current built-ins:
 - `read_file`
 - `write_file`
 - `edit`
+- `find_symbol`
 - `shell`
 - `list_dir`
 - `grep`
@@ -386,5 +406,5 @@ A few practical things to know:
 1. Install the Python dependencies you need for this repo.
 2. Set `API_KEY` and optionally `BASE_URL`, or configure a model profile.
 3. Run `python3 main.py`.
-4. Type a request at the `⬡ you ›` prompt.
+4. Type a request at the `╰─ you ›` prompt.
 5. Use `/help` if you want to inspect commands from inside the app.

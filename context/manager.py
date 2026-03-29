@@ -42,13 +42,36 @@ class ContextManager:
         config: Config,
         user_memory: str | None,
         tools: list[Tool] | None,
+        workspace_snapshot: str | None = None,
+        code_index_summary: str | None = None,
     ) -> None:
-        self._system_prompt = get_system_prompt(config, user_memory, tools)
         self.config = config
         self._model_name = self.config.model_name
+        self._user_memory = user_memory
+        self._tools = tools
+        self._workspace_snapshot = workspace_snapshot
+        self._code_index_summary = code_index_summary
+        self._system_prompt = self._build_system_prompt()
         self._messages: list[MessageItem] = []
         self._latest_usage = TokenUsage()
         self.total_usage = TokenUsage()
+
+    def _build_system_prompt(self) -> str:
+        return get_system_prompt(
+            self.config,
+            user_memory=self._user_memory,
+            tools=self._tools,
+            workspace_snapshot=self._workspace_snapshot,
+            code_index_summary=self._code_index_summary,
+        )
+
+    def set_workspace_snapshot(self, workspace_snapshot: str | None) -> None:
+        self._workspace_snapshot = workspace_snapshot
+        self._system_prompt = self._build_system_prompt()
+
+    def set_code_index_summary(self, code_index_summary: str | None) -> None:
+        self._code_index_summary = code_index_summary
+        self._system_prompt = self._build_system_prompt()
 
     @property
     def message_count(self) -> int:

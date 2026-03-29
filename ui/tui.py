@@ -86,6 +86,7 @@ def get_console() -> Console:
 
 
 class TUI:
+    _PROMPT_MARKER = "╰─"
     _LOGO = "\n".join(
         [
             "     ██╗ █████╗ ███████╗███████╗       ██████╗ ██████╗ ██████╗ ███████╗",
@@ -197,7 +198,10 @@ class TUI:
         return Text(" • ".join(clean_parts), style=style)
 
     def prompt(self) -> str:
-        return "\n[prompt]⬡[/prompt] [prompt.hint]you › [/prompt.hint]"
+        return (
+            f"\n[prompt]{self._PROMPT_MARKER}[/prompt] "
+            "[prompt.hint]you › [/prompt.hint]"
+        )
 
     def _prompt_message(self):
         if FormattedText is None:
@@ -206,7 +210,7 @@ class TUI:
         return FormattedText(
             [
                 ("", "\n"),
-                ("fg:#00e5e5", "⬡ "),
+                ("fg:#00e5e5", f"{self._PROMPT_MARKER} "),
                 ("fg:#555555", "you › "),
             ]
         )
@@ -247,7 +251,7 @@ class TUI:
         self.console.print(Text(self._LOGO, style="brand"))
         self.console.print(
             Text(
-                "─── A LOCAL CODING AGENT  ·  STREAMING  ·  TOOLS  ·  APPROVALS ───",
+                "─── A LOCAL CODING AGENT  ·  TOOLS  ·  APPROVALS ───",
                 style="muted",
             )
         )
@@ -258,7 +262,7 @@ class TUI:
         self.console.print(Text("commands", style="muted"))
         self.console.print(
             self._command_pills(
-                ["/help", "/config", "/models", "/approval", "/model", "/exit"]
+                ["/help", "/scan", "/index", "/config", "/models", "/approval", "/model", "/exit"]
             )
         )
         self.console.print()
@@ -409,7 +413,7 @@ class TUI:
                 detail = suffix.strip() or prefix.strip()
 
         line = Text()
-        line.append("⬡ ", style="thinking.badge")
+        line.append(f"{self._PROMPT_MARKER} ", style="thinking.badge")
         line.append(f"{label.lower()} › ", style="muted")
         line.append(detail, style="thinking")
 
@@ -429,7 +433,7 @@ class TUI:
         }.get(level, "info")
 
         line = Text()
-        line.append("⬡ ", style="thinking.badge")
+        line.append(f"{self._PROMPT_MARKER} ", style="thinking.badge")
         line.append(f"{level} › ", style="muted")
         line.append(message, style=text_style)
         self.console.print()
@@ -440,6 +444,7 @@ class TUI:
             "read_file": ["path", "offset", "limit"],
             "write_file": ["path", "create_directories", "content"],
             "edit": ["path", "replace_all", "old_string", "new_string"],
+            "find_symbol": ["query", "kind", "language", "limit"],
             "shell": ["command", "timeout", "cwd"],
             "list_dir": ["path", "include_hidden"],
             "grep": ["path", "case_insensitive", "pattern"],
@@ -729,6 +734,26 @@ class TUI:
                     truncate_text(output, self.config.model_name, self._max_block_tokens)
                 )
             )
+        elif name == "find_symbol" and success:
+            blocks.append(
+                self._summary_text(
+                    [
+                        args.get("query"),
+                        (
+                            f"{metadata.get('matches')} matches"
+                            if metadata and isinstance(metadata.get("matches"), int)
+                            else None
+                        ),
+                        args.get("language"),
+                        args.get("kind"),
+                    ]
+                )
+            )
+            blocks.append(
+                self._render_output_block(
+                    truncate_text(output, self.config.model_name, self._max_block_tokens)
+                )
+            )
         elif name == "glob" and success:
             if metadata and isinstance(metadata.get("matches"), int):
                 blocks.append(Text(f"{metadata['matches']} matches", style="muted"))
@@ -932,6 +957,54 @@ class TUI:
             )
         )
 
+    def show_workspace_snapshot(self, summary: str | None) -> None:
+        self.console.print()
+
+        if not summary:
+            body = Text("No workspace snapshot is available yet.", style="muted")
+        else:
+            body = Syntax(
+                summary,
+                "markdown",
+                theme="monokai",
+                word_wrap=True,
+                line_numbers=False,
+            )
+
+        self.console.print(
+            self._panel(
+                body,
+                title=Text.assemble(
+                    self._badge("Scan", "status.info.badge"),
+                    (" Workspace snapshot", "panel.title"),
+                ),
+            )
+        )
+
+    def show_code_index(self, summary: str | None) -> None:
+        self.console.print()
+
+        if not summary:
+            body = Text("No code index is available yet.", style="muted")
+        else:
+            body = Syntax(
+                summary,
+                "markdown",
+                theme="monokai",
+                word_wrap=True,
+                line_numbers=False,
+            )
+
+        self.console.print(
+            self._panel(
+                body,
+                title=Text.assemble(
+                    self._badge("Index", "status.info.badge"),
+                    (" Codebase index", "panel.title"),
+                ),
+            )
+        )
+
     def show_stats(self, stats: dict[str, Any]) -> None:
         self.console.print()
         self.console.print(
@@ -1017,6 +1090,8 @@ class TUI:
         commands.add_row(Text("/help"), "Show this help screen")
         commands.add_row(Text("/exit or /quit"), "Exit the agent")
         commands.add_row(Text("/clear"), "Clear conversation history")
+        commands.add_row(Text("/scan"), "Refresh and show workspace context")
+        commands.add_row(Text("/index"), "Refresh and show the codebase symbol index")
         commands.add_row(Text("/config"), "Show current configuration")
         commands.add_row(Text("/models"), "List configured model profiles")
         commands.add_row(Text("/model <name>"), "Switch profile or change model name")
@@ -1035,6 +1110,7 @@ class TUI:
                 Text("Type a normal message to start an agent run.", style="muted"),
                 Text("Press Ctrl+C to stop the current run and return to the prompt.", style="muted"),
                 Text("Tool calls, approvals, and outputs are shown as structured cards.", style="muted"),
+                Text("Use /index or the find_symbol tool to jump to definitions faster.", style="muted"),
                 Text(
                     "Add custom providers in .ai-agent/config.toml with [models.<name>].",
                     style="muted",
