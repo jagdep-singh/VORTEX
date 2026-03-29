@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -19,6 +20,7 @@ from rich.theme import Theme
 
 from config.config import Config
 from tools.base import ToolConfirmation
+from utils.model_health import ModelHealthRecord
 from utils.paths import display_path_rel_to_cwd
 from utils.text import truncate_text
 
@@ -219,6 +221,38 @@ class TUI:
     def _summary_text(self, parts: Iterable[Any], style: str = "muted") -> Text:
         clean_parts = [str(part) for part in parts if part not in (None, "", [])]
         return Text(" • ".join(clean_parts), style=style)
+
+    def _short_text(self, value: str | None, limit: int = 72) -> str:
+        if not value:
+            return ""
+        clean = " ".join(str(value).split())
+        if len(clean) <= limit:
+            return clean
+        return clean[: limit - 3] + "..."
+
+    def _model_status_text(self, status: str | None) -> Text:
+        label = status or "unknown"
+        style_map = {
+            "working": "success",
+            "unknown": "muted",
+            "missing-key": "warning",
+            "quota": "warning",
+            "rate-limited": "warning",
+            "auth-error": "error",
+            "unavailable": "error",
+            "offline": "warning",
+            "error": "error",
+        }
+        return Text(label, style=style_map.get(label, "muted"))
+
+    def _format_checked_at(self, checked_at: str | None) -> str:
+        if not checked_at:
+            return "-"
+        try:
+            dt = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+        except ValueError:
+            return checked_at
+        return dt.strftime("%Y-%m-%d %H:%M")
 
     def prompt(self) -> str:
         return (
@@ -1120,10 +1154,12 @@ class TUI:
                         ("Base URL", base_url),
                         ("API key source", self.config.api_key_source_label),
                         ("Temperature", self.config.temperature),
+                        ("Max output tokens", self.config.max_output_tokens),
                         ("Approval", self.config.approval.value),
                         ("Working dir", self.config.cwd),
                         ("Max turns", self.config.max_turns),
                         ("Configured profiles", len(self.config.models)),
+                        ("Catalog models", len(self.config.list_catalog_models())),
                         ("Hooks enabled", self.config.hooks_enabled),
                     ]
                 ),
@@ -1134,17 +1170,22 @@ class TUI:
             )
         )
 
-    def show_model_profiles(self, config: Config) -> None:
-        table = Table(expand=True, box=None, padding=(0, 1))
-        table.add_column("Name", style="meta.value")
-        table.add_column("Model", style="meta.value")
-        table.add_column("Base URL", style="muted")
-        table.add_column("Key source", style="muted")
-        table.add_column("Active", style="meta.value", no_wrap=True)
+    def show_model_profiles(
+        self,
+        config: Config,
+        *,
+        model_health: dict[str, ModelHealthRecord] | None = None,
+    ) -> None:
+        profile_table = Table(expand=True, box=None, padding=(0, 1))
+        profile_table.add_column("Name", style="meta.value")
+        profile_table.add_column("Model", style="meta.value")
+        profile_table.add_column("Base URL", style="muted")
+        profile_table.add_column("Key source", style="muted")
+        profile_table.add_column("Active", style="meta.value", no_wrap=True)
 
         profiles = config.list_model_profiles()
         for name, profile in profiles:
-            table.add_row(
+            profile_table.add_row(
                 name,
                 profile.model.name,
                 profile.base_url or "default",
@@ -1152,16 +1193,62 @@ class TUI:
                 "yes" if config.active_model_profile == name else "",
             )
 
-        if not profiles:
-            body = Group(
+        profile_section = (
+            profile_table
+            if profiles
+            else Group(
                 Text("No custom model profiles configured yet.", style="muted"),
                 Text(
                     "Add them in .ai-agent/config.toml under [models.<name>].",
                     style="muted",
                 ),
             )
-        else:
-            body = table
+        )
+
+        catalog_models = config.list_catalog_models()
+        catalog_table = Table(expand=True, box=None, padding=(0, 1))
+        catalog_table.add_column("#", style="meta.label", no_wrap=True)
+        catalog_table.add_column("Model ID", style="meta.value")
+        catalog_table.add_column("Route", style="muted", no_wrap=True)
+        catalog_table.add_column("Status", no_wrap=True)
+        catalog_table.add_column("Checked", style="muted", no_wrap=True)
+        catalog_table.add_column("Note", style="muted")
+        catalog_table.add_column("Active", style="meta.value", no_wrap=True)
+
+        for index, model_name in enumerate(catalog_models, start=1):
+            record = (model_health or {}).get(model_name)
+            catalog_table.add_row(
+                str(index),
+                model_name,
+                "openrouter",
+                self._model_status_text(record.status if record else "unknown"),
+                self._format_checked_at(record.checked_at if record else None),
+                self._short_text(record.detail if record else ""),
+                (
+                    "yes"
+                    if config.active_model_profile == "openrouter"
+                    and config.model_name == model_name
+                    else ""
+                ),
+            )
+
+        catalog_section = (
+            catalog_table
+            if catalog_models
+            else Text("No model catalog entries are available.", style="muted")
+        )
+
+        body = Group(
+            Text("Profiles", style="meta.label"),
+            profile_section,
+            Text(),
+            Text("Catalog", style="meta.label"),
+            Text(
+                "Use /models refresh to probe the catalog, then /model <number> or /model <model-id> to switch.",
+                style="muted",
+            ),
+            catalog_section,
+        )
 
         self.console.print()
         self.console.print(
@@ -1169,7 +1256,10 @@ class TUI:
                 body,
                 title=Text.assemble(
                     self._badge("Models", "status.info.badge"),
-                    (f" Configured profiles ({len(profiles)})", "panel.title"),
+                    (
+                        f" Profiles {len(profiles)} · Catalog {len(catalog_models)}",
+                        "panel.title",
+                    ),
                 ),
                 subtitle=Text(
                     f"active: {config.active_model_profile or 'default'}",
@@ -1345,8 +1435,9 @@ class TUI:
         commands.add_row(Text("/cwd [path|index]"), "Switch to another project directory")
         commands.add_row(Text("/recent"), "Show remembered workspaces")
         commands.add_row(Text("/config"), "Show current configuration")
-        commands.add_row(Text("/models"), "List configured model profiles")
-        commands.add_row(Text("/model <name>"), "Switch profile or change model name")
+        commands.add_row(Text("/models [refresh]"), "List model profiles or probe the bundled catalog")
+        commands.add_row(Text("/model <name|number>"), "Switch profile, pick a checked catalog model, or change the model name")
+        commands.add_row(Text("/model force <name|number>"), "Override the health guard for a catalog model")
         commands.add_row(Text("/approval <mode>"), "Change approval mode")
         commands.add_row(Text("/stats"), "Show session statistics")
         commands.add_row(Text("/tools"), "List available tools")

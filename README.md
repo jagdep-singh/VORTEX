@@ -105,7 +105,7 @@ Legacy single-provider setup:
 
 ```bash
 API_KEY=your_key_here
-BASE_URL=https://openrouter.ai/api/v1
+BASE_URL=https://api.openai.com/v1
 ```
 
 You can place these in a local `.env` file. If you store secrets in `.env`, keep that file out of version control.
@@ -208,7 +208,16 @@ VORTEX now supports named provider profiles, so users are not locked to one mode
 You can define them in `.ai-agent/config.toml` for the active working directory:
 
 ```toml
-active_model_profile = "openrouter"
+active_model_profile = "openai"
+
+[models.openai]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[models.openai.model]
+name = "gpt-5-mini"
+temperature = 0.2
+max_output_tokens = 8192
 
 [models.openrouter]
 base_url = "https://openrouter.ai/api/v1"
@@ -217,15 +226,12 @@ api_key_env = "OPENROUTER_API_KEY"
 [models.openrouter.model]
 name = "nvidia/nemotron-3-super-120b-a12b:free"
 temperature = 0
-
-[models.openai]
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-
-[models.openai.model]
-name = "gpt-4.1-mini"
-temperature = 0.2
+max_output_tokens = 8192
 ```
+
+VORTEX also ships with a bundled OpenRouter model catalog in [`.ai-agent/models.txt`](./.ai-agent/models.txt). Those entries show up in `/models`, and you can switch to them with either the exact model ID or its number from the list.
+
+To avoid trial-and-error switching, VORTEX can also probe those catalog models and cache their status locally. This lets the UI show whether a model is currently `working`, blocked by `quota`, missing a key, or otherwise unavailable before you switch to it.
 
 You can also inline a key directly:
 
@@ -237,14 +243,20 @@ api_key = "your_key_here"
 [models.local_gateway.model]
 name = "some/model"
 temperature = 0
+max_output_tokens = 8192
 ```
 
 Runtime commands:
 
-- `/models` shows configured profiles
+- `/models` shows configured profiles and the bundled model catalog
+- `/models refresh` probes the catalog and updates cached working/not-working status
 - `/model openrouter` switches to a named profile
 - `/model use openrouter` also switches to a named profile
-- `/model gpt-4.1-mini` changes the current model name directly
+- `/model 1` switches to the first catalog model
+- typing `1` at the prompt also selects the first catalog model when a catalog is loaded
+- `/model openai/gpt-5.4-mini` switches to that catalog model through the OpenRouter profile
+- `/model force 17` overrides the health guard and still tries that catalog model
+- `/model gpt-5-mini` changes the current model name directly
 - `/config` shows the active model, base URL, and API key source
 
 If the active profile has no resolved API key, the app will warn you.
@@ -262,8 +274,9 @@ The terminal command set currently includes:
 - `/cwd [path|index]`
 - `/recent`
 - `/config`
-- `/models`
-- `/model <name>`
+- `/models [refresh]`
+- `/model <name|number>`
+- `/model force <name|number>`
 - `/approval <mode>`
 - `/stats`
 - `/tools`

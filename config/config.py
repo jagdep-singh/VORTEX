@@ -7,9 +7,10 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class ModelConfig(BaseModel):
-    name: str = "nvidia/nemotron-3-super-120b-a12b:free"
+    name: str = "gpt-5-mini"
     temperature: float = Field(default=1, ge=0.0, le=2.0)
     context_window: int = 256_000
+    max_output_tokens: int = Field(default=8192, ge=256)
 
 
 class ModelProfileConfig(BaseModel):
@@ -117,6 +118,7 @@ class Config(BaseModel):
     cwd: Path = Field(default_factory=_workspace)
     active_model_profile: str | None = None
     models: dict[str, ModelProfileConfig] = Field(default_factory=dict)
+    model_catalog: list[str] = Field(default_factory=list)
 
     shell_environment: ShellEnvironmentPolicy = Field(
         default_factory=ShellEnvironmentPolicy
@@ -156,6 +158,32 @@ class Config(BaseModel):
     def get_model_profile(self, name: str) -> ModelProfileConfig | None:
         return self.models.get(name)
 
+    def ensure_model_profile(
+        self,
+        name: str,
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        api_key_env: str | None = None,
+    ) -> ModelProfileConfig:
+        profile = self.models.get(name)
+        if profile is None:
+            profile = ModelProfileConfig(
+                base_url=base_url,
+                api_key=api_key,
+                api_key_env=api_key_env,
+            )
+            self.models[name] = profile
+            return profile
+
+        if base_url and not profile.base_url:
+            profile.base_url = base_url
+        if api_key and not profile.api_key:
+            profile.api_key = api_key
+        if api_key_env and not profile.api_key_env:
+            profile.api_key_env = api_key_env
+        return profile
+
     @property
     def active_profile(self) -> ModelProfileConfig | None:
         if not self.active_model_profile:
@@ -176,6 +204,8 @@ class Config(BaseModel):
             resolved = profile.resolved_api_key
             if resolved:
                 return resolved
+            if profile.api_key or profile.api_key_env:
+                return None
         return os.environ.get("API_KEY")
 
     @property
@@ -183,7 +213,7 @@ class Config(BaseModel):
         profile = self.active_profile
         if profile and profile.base_url:
             return profile.base_url
-        return os.environ.get("BASE_URL")
+        return os.environ.get("BASE_URL") or "https://api.openai.com/v1"
 
     @property
     def model_name(self) -> str:
@@ -202,6 +232,14 @@ class Config(BaseModel):
         self.current_model_config.temperature = value
 
     @property
+    def max_output_tokens(self) -> int:
+        return self.current_model_config.max_output_tokens
+
+    @max_output_tokens.setter
+    def max_output_tokens(self, value: int) -> None:
+        self.current_model_config.max_output_tokens = value
+
+    @property
     def api_key_source_label(self) -> str:
         profile = self.active_profile
         if profile:
@@ -209,10 +247,10 @@ class Config(BaseModel):
                 return f"profile:{self.active_model_profile}.api_key"
             if profile.api_key_env and os.environ.get(profile.api_key_env):
                 return f"env:{profile.api_key_env}"
+            if profile.api_key_env:
+                return f"missing:{profile.api_key_env}"
         if os.environ.get("API_KEY"):
             return "env:API_KEY"
-        if profile and profile.api_key_env:
-            return f"missing:{profile.api_key_env}"
         return "missing"
 
     @property
@@ -228,6 +266,17 @@ class Config(BaseModel):
 
     def list_model_profiles(self) -> list[tuple[str, ModelProfileConfig]]:
         return list(self.models.items())
+
+    def list_catalog_models(self) -> list[str]:
+        seen: set[str] = set()
+        catalog: list[str] = []
+        for model_name in self.model_catalog:
+            candidate = model_name.strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            catalog.append(candidate)
+        return catalog
 
     def validate(self) -> list[str]:
         errors: list[str] = []

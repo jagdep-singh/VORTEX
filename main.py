@@ -1,5 +1,7 @@
 import asyncio
+from collections import Counter
 import contextlib
+import os
 from pathlib import Path
 import sys
 
@@ -18,11 +20,22 @@ from agent.session import Session
 from config.config import ApprovalPolicy, Config
 from config.loader import load_config
 from ui.tui import TUI, get_console
+from utils.model_catalog import load_model_catalog
+from utils.model_health import (
+    ModelHealthChecker,
+    ModelHealthRecord,
+    ModelHealthStore,
+    classify_error_text,
+)
 from utils.workspace_history import WorkspaceHistoryManager
 
 load_dotenv(PROJECT_ROOT / ".env")
 
 console = get_console()
+APP_MODEL_CATALOG_PATH = PROJECT_ROOT / ".ai-agent/models.txt"
+OPENROUTER_PROFILE_NAME = "openrouter"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 
 
 class CLI:
@@ -36,6 +49,7 @@ class CLI:
         self.tui = TUI(config, console)
         self._active_message_task: asyncio.Task[str | None] | None = None
         self.workspace_history = workspace_history or WorkspaceHistoryManager()
+        self.model_health_store = ModelHealthStore()
 
     async def _reset_model_client(self) -> None:
         if self.agent and self.agent.session and self.agent.session.client:
@@ -44,6 +58,7 @@ class CLI:
     async def _load_config_for_workspace(self, target: Path) -> Config:
         target = _validate_workspace_directory(target)
         config = load_config(cwd=target)
+        _attach_model_catalog(config, target)
         config.cwd = target
 
         errors = config.validate()
@@ -176,6 +191,70 @@ class CLI:
 
         return False
 
+    def _catalog_health_records(self) -> dict[str, ModelHealthRecord]:
+        return self.model_health_store.get_many(
+            OPENROUTER_PROFILE_NAME,
+            self.config.list_catalog_models(),
+        )
+
+    def _is_openrouter_catalog_model(self, model_name: str | None = None) -> bool:
+        candidate = model_name or self.config.model_name
+        return (
+            self.config.active_model_profile == OPENROUTER_PROFILE_NAME
+            and candidate in self.config.list_catalog_models()
+        )
+
+    def _record_catalog_model_health(
+        self,
+        *,
+        model_name: str,
+        status: str,
+        detail: str | None = None,
+    ) -> None:
+        self.model_health_store.save_record(
+            ModelHealthRecord.create(
+                provider=OPENROUTER_PROFILE_NAME,
+                model=model_name,
+                status=status,
+                detail=detail,
+            )
+        )
+
+    async def _refresh_catalog_model_health(self) -> None:
+        catalog_models = self.config.list_catalog_models()
+        if not catalog_models:
+            self.tui.show_notice("No catalog models are available to check.", level="info")
+            return
+
+        profile = _ensure_openrouter_profile(self.config)
+        checker = ModelHealthChecker(
+            provider=OPENROUTER_PROFILE_NAME,
+            base_url=profile.base_url or OPENROUTER_BASE_URL,
+            api_key=profile.resolved_api_key or profile.api_key,
+            store=self.model_health_store,
+        )
+
+        async def on_progress(index: int, total: int, record: ModelHealthRecord) -> None:
+            self.tui.show_status(
+                f"Checking models {index}/{total}: {record.model}"
+            )
+
+        self.tui.show_status("Checking catalog model availability...")
+        records = await checker.probe_models(
+            catalog_models,
+            progress_callback=on_progress,
+        )
+        self.tui.clear_status()
+
+        counts = Counter(record.status for record in records)
+        working = counts.get("working", 0)
+        blocked = len(records) - working
+        notice_level = "success" if blocked == 0 else "warning"
+        self.tui.show_notice(
+            f"Checked {len(records)} models: {working} working, {blocked} not ready.",
+            level=notice_level,
+        )
+
     async def run_single(self, message: str) -> str | None:
         async with Agent(self.config) as agent:
             self.agent = agent
@@ -195,6 +274,16 @@ class CLI:
                     user_input = (await self.tui.read_prompt()).strip()
                     if not user_input:
                         continue
+
+                    if user_input.isdigit():
+                        selected_index = int(user_input)
+                        if 1 <= selected_index <= len(self.config.list_catalog_models()):
+                            should_continue = await self._handle_command(
+                                f"/model {user_input}"
+                            )
+                            if not should_continue:
+                                break
+                            continue
 
                     if user_input.startswith("/"):
                         should_continue = await self._handle_command(user_input)
@@ -239,6 +328,7 @@ class CLI:
         assistant_streaming = False
         final_response: str | None = None
         status_animation_task = asyncio.create_task(self._animate_status())
+        current_model_name = self.config.model_name
 
         try:
             async for event in self.agent.run(message):
@@ -263,6 +353,13 @@ class CLI:
                     self.tui.clear_status()
                 elif event.type == AgentEventType.AGENT_ERROR:
                     error = event.data.get("error", "Unknown error")
+                    if self._is_openrouter_catalog_model(current_model_name):
+                        status, detail = classify_error_text(error)
+                        self._record_catalog_model_health(
+                            model_name=current_model_name,
+                            status=status,
+                            detail=detail,
+                        )
                     self.tui.clear_status()
                     self.tui.show_notice(f"Error: {error}", level="error")
                 elif event.type == AgentEventType.TOOL_CALL_START:
@@ -298,6 +395,12 @@ class CLI:
             status_animation_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await status_animation_task
+
+        if final_response is not None and self._is_openrouter_catalog_model(current_model_name):
+            self._record_catalog_model_health(
+                model_name=current_model_name,
+                status="working",
+            )
 
         return final_response
 
@@ -371,11 +474,28 @@ class CLI:
         elif cmd_name_lower == "/config":
             self.tui.show_config()
         elif cmd_name_lower == "/models":
-            self.tui.show_model_profiles(self.config)
+            action = cmd_args.strip().lower()
+            if action in {"refresh", "check"}:
+                await self._refresh_catalog_model_health()
+            elif action:
+                self.tui.show_notice(
+                    "Usage: /models or /models refresh",
+                    level="error",
+                )
+                return True
+            self.tui.show_model_profiles(
+                self.config,
+                model_health=self._catalog_health_records(),
+            )
         elif cmd_name_lower == "/model":
             if cmd_args:
                 target = cmd_args.strip()
                 profile_name = None
+                force_switch = False
+
+                if target.startswith("force "):
+                    force_switch = True
+                    target = target[6:].strip()
 
                 if target.startswith("use "):
                     profile_name = target[4:].strip()
@@ -400,6 +520,29 @@ class CLI:
                             )
                     except ValueError as exc:
                         self.tui.show_notice(str(exc), level="error")
+                elif target.isdigit():
+                    catalog_models = self.config.list_catalog_models()
+                    selected_index = int(target) - 1
+                    if 0 <= selected_index < len(catalog_models):
+                        selected_model = catalog_models[selected_index]
+                        await self._switch_to_catalog_model(
+                            selected_model,
+                            force=force_switch,
+                        )
+                    else:
+                        self.tui.show_notice(
+                            f"No catalog model at index {target}.",
+                            level="error",
+                        )
+                        self.tui.show_notice(
+                            "Use /models to inspect the available catalog entries.",
+                            level="info",
+                        )
+                elif target in self.config.list_catalog_models():
+                    await self._switch_to_catalog_model(
+                        target,
+                        force=force_switch,
+                    )
                 else:
                     self.config.model_name = target
                     await self._reset_model_client()
@@ -582,15 +725,96 @@ class CLI:
 
         return True
 
+    async def _switch_to_catalog_model(self, model_name: str, *, force: bool = False) -> None:
+        _ensure_openrouter_profile(self.config)
+
+        if not force:
+            health_record = self.model_health_store.get(OPENROUTER_PROFILE_NAME, model_name)
+            if health_record is None:
+                self.tui.show_notice(
+                    f"Model status for '{model_name}' is unknown.",
+                    level="warning",
+                )
+                self.tui.show_notice(
+                    "Run /models refresh first, or use /model force <name|number> to override.",
+                    level="info",
+                )
+                return
+
+            if health_record.status != "working":
+                self.tui.show_notice(
+                    f"Model '{model_name}' is currently marked {health_record.status}.",
+                    level="error",
+                )
+                if health_record.detail:
+                    self.tui.show_notice(health_record.detail, level="info")
+                self.tui.show_notice(
+                    "Run /models refresh later, or use /model force <name|number> if you still want to try it.",
+                    level="info",
+                )
+                return
+
+        self.config.switch_model_profile(OPENROUTER_PROFILE_NAME)
+        self.config.model_name = model_name
+        await self._reset_model_client()
+
+        if self.config.api_key:
+            self.tui.show_notice(
+                f"Model changed to: {model_name} via profile '{OPENROUTER_PROFILE_NAME}'",
+                level="success",
+            )
+        else:
+            self.tui.show_notice(
+                f"Switched to '{model_name}' via profile '{OPENROUTER_PROFILE_NAME}', "
+                "but no OpenRouter API key is currently resolved.",
+                level="warning",
+            )
+
 
 def _load_validated_config(requested_cwd: Path) -> Config:
     validated_cwd = _validate_workspace_directory(requested_cwd)
     config = load_config(cwd=validated_cwd)
+    _attach_model_catalog(config, validated_cwd)
     config.cwd = validated_cwd
     errors = config.validate()
     if errors:
         raise ValueError("\n".join(errors))
     return config
+
+
+def _attach_model_catalog(config: Config, target_cwd: Path) -> None:
+    project_catalog_path = target_cwd.resolve() / ".ai-agent/models.txt"
+    config.model_catalog = load_model_catalog(
+        [APP_MODEL_CATALOG_PATH, project_catalog_path]
+    )
+
+
+def _resolve_openrouter_api_key(config: Config) -> str | None:
+    profile = config.get_model_profile(OPENROUTER_PROFILE_NAME)
+    if profile:
+        resolved = profile.resolved_api_key or profile.api_key
+        if resolved:
+            return resolved
+
+    openrouter_env_key = os.environ.get(OPENROUTER_API_KEY_ENV)
+    if openrouter_env_key:
+        return openrouter_env_key
+
+    global_key = os.environ.get("API_KEY")
+    global_base_url = (os.environ.get("BASE_URL") or "").lower()
+    if global_key and "openrouter.ai" in global_base_url:
+        return global_key
+
+    return None
+
+
+def _ensure_openrouter_profile(config: Config):
+    return config.ensure_model_profile(
+        OPENROUTER_PROFILE_NAME,
+        base_url=OPENROUTER_BASE_URL,
+        api_key=_resolve_openrouter_api_key(config),
+        api_key_env=OPENROUTER_API_KEY_ENV,
+    )
 
 
 def _resolve_workspace_path(path_input: str, base_dir: Path) -> Path:

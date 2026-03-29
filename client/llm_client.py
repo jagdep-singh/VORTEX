@@ -67,6 +67,7 @@ class LLMClient:
             "messages": messages,
             "stream": stream,
             "temperature": self.config.temperature,
+            "max_tokens": self.config.max_output_tokens,
         }
 
         if tools:
