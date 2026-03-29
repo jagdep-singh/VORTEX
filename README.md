@@ -1,13 +1,13 @@
-# Jazz-Code
+# VORTEX
 
-Jazz-Code is a local terminal coding agent built around an OpenAI-compatible chat API, a Rich-based TUI, and a small tool system for reading files, editing code, running shell commands, and managing sessions.
+VORTEX is a local terminal coding agent built around an OpenAI-compatible chat API, a Rich-based TUI, and a small tool system for reading files, editing code, running shell commands, and managing sessions.
 
 It is designed to run against a working directory on your machine, stream model output live, show tool calls as they happen, and keep enough session state around to support multi-step coding tasks.
 
 ## What This Project Does
 
 - Runs in interactive mode or single-prompt mode
-- Streams assistant output and tool execution in a custom terminal UI
+- Streams VORTEX agent output and tool execution in a custom terminal UI
 - Lets the model call local tools such as file read/write/edit, search, shell, and memory
 - Builds a compact workspace snapshot so the agent starts with project context
 - Builds a lightweight symbol index so the agent can reason about functions, classes, structs, and types
@@ -24,7 +24,9 @@ The entrypoint is [main.py](./main.py).
 By default:
 
 - the app starts in interactive mode if you run `python3 main.py`
-- the active working directory is `./workspace`
+- if you do not pass `--cwd`, VORTEX shows a workspace picker before the session starts
+- the picker includes a `Custom path...` option for manually entering a project directory
+- the selected working directory is remembered for later sessions
 - the terminal UI is rendered by [ui/tui.py](./ui/tui.py)
 - the agent runtime is driven by [agent/agent.py](./agent/agent.py)
 
@@ -46,17 +48,34 @@ Use a different working directory:
 python3 main.py --cwd .
 ```
 
-## Important Working Directory Note
+Switch projects inside the app:
+
+```text
+/cwd
+/cwd .
+/cwd ~/some/project
+/cwd 2
+```
+
+## Working Directory Behavior
 
 Config and tool discovery are tied to the active `cwd`.
 
-- If you run `python3 main.py`, the app uses `./workspace`
+- If you run `python3 main.py --cwd <path>`, that directory is used directly
+- If you run `python3 main.py` interactively, VORTEX asks you to choose a working directory first
+- Custom paths are validated as existing directories before the session switches to them
+- Recent working directories are remembered and can be reopened with `/cwd <index>` or viewed with `/recent`
 - If you want project-local config from the repo root, run `python3 main.py --cwd .`
 - `.ai-agent/config.toml` is loaded from the active working directory
 - `AGENT.MD` is also loaded from the active working directory
 - `.ai-agent/tools/*.py` is discovered from the active working directory
 
-That means repo-root config is not automatically used unless the repo root is the active `cwd`.
+Changing `cwd` is treated as a project switch:
+
+- the app reloads config and `AGENT.MD` from the new directory
+- project-local tools are rediscovered
+- the workspace snapshot and code index are rebuilt
+- the live session context is reset to avoid mixing projects
 
 ## Requirements
 
@@ -105,7 +124,7 @@ The container is built for interactive terminal usage.
 Build the image:
 
 ```bash
-docker build -t jazz-code .
+docker build -t vortex .
 ```
 
 Compose build:
@@ -120,12 +139,12 @@ Start with Compose:
 docker compose up --build
 ```
 
-For this specific project, `docker compose run --rm jazz-code` is usually the better choice because Jazz-Code is an interactive terminal app rather than a background service.
+For this specific project, `docker compose run --rm vortex` is usually the better choice because VORTEX is an interactive terminal app rather than a background service.
 
 Interactive Compose run:
 
 ```bash
-docker compose run --rm jazz-code
+docker compose run --rm vortex
 ```
 
 Run it against the current directory as the working project:
@@ -134,8 +153,8 @@ Run it against the current directory as the working project:
 docker run --rm -it \
   --env-file .env \
   -v "$PWD":/workspace \
-  -v jazz-code-data:/data \
-  jazz-code
+  -v vortex-data:/data \
+  vortex
 ```
 
 What that does:
@@ -151,8 +170,8 @@ Single prompt mode:
 docker run --rm -it \
   --env-file .env \
   -v "$PWD":/workspace \
-  -v jazz-code-data:/data \
-  jazz-code "write a hello world program in c"
+  -v vortex-data:/data \
+  vortex "write a hello world program in c"
 ```
 
 Use a different mounted project:
@@ -161,8 +180,8 @@ Use a different mounted project:
 docker run --rm -it \
   --env-file .env \
   -v /path/to/project:/workspace \
-  -v jazz-code-data:/data \
-  jazz-code
+  -v vortex-data:/data \
+  vortex
 ```
 
 Override the working directory manually:
@@ -171,8 +190,8 @@ Override the working directory manually:
 docker run --rm -it \
   --env-file .env \
   -v "$PWD":/workspace \
-  -v jazz-code-data:/data \
-  jazz-code --cwd /workspace/subdir
+  -v vortex-data:/data \
+  vortex --cwd /workspace/subdir
 ```
 
 Notes:
@@ -184,7 +203,7 @@ Notes:
 
 ## Custom Model Profiles
 
-Jazz-Code now supports named provider profiles, so users are not locked to one model or one API key.
+VORTEX now supports named provider profiles, so users are not locked to one model or one API key.
 
 You can define them in `.ai-agent/config.toml` for the active working directory:
 
@@ -240,6 +259,8 @@ The terminal command set currently includes:
 - `/clear`
 - `/scan`
 - `/index`
+- `/cwd [path|index]`
+- `/recent`
 - `/config`
 - `/models`
 - `/model <name>`
@@ -257,14 +278,15 @@ Useful interaction behavior:
 
 - `Ctrl+C` stops the current run without exiting the app
 - arrow keys work in the input prompt through `prompt_toolkit`
-- assistant output streams live
+- VORTEX agent output streams live
 - tool calls are rendered as structured terminal cards
 - the agent refreshes a compact workspace snapshot at the start of each run
 - the agent also refreshes a lightweight codebase index and exposes it through `/index` and `find_symbol`
+- `/cwd` switches the whole active project and rebuilds session context
 
 ## Codebase Index
 
-Jazz-Code now includes a lightweight source-code index that extracts symbols from common languages such as Python, C, C++, JavaScript, TypeScript, Go, Rust, and Java.
+VORTEX now includes a lightweight source-code index that extracts symbols from common languages such as Python, C, C++, JavaScript, TypeScript, Go, Rust, and Java.
 
 This gives the agent a faster way to orient itself around a project:
 
@@ -362,8 +384,8 @@ Available trigger points:
 The current UI is a custom Rich interface with:
 
 - a cyan-on-dark shell theme
-- a Jazz-Code ASCII header
-- streaming assistant output
+- a VORTEX ASCII header
+- streaming VORTEX agent output
 - inline styling for backticked text
 - structured tool call panels
 - approval prompts

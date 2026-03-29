@@ -8,6 +8,7 @@ from typing import Any, Iterable
 from rich import box
 from rich.columns import Columns
 from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.rule import Rule
@@ -23,10 +24,12 @@ from utils.text import truncate_text
 
 try:
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import PathCompleter
     from prompt_toolkit.formatted_text import FormattedText
     from prompt_toolkit.history import InMemoryHistory
 except Exception:
     PromptSession = None
+    PathCompleter = None
     FormattedText = None
     InMemoryHistory = None
 
@@ -87,14 +90,19 @@ def get_console() -> Console:
 
 class TUI:
     _PROMPT_MARKER = "╰─"
+    _WORKSPACE_PROMPT_LABEL = "workspace"
+    _STATUS_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     _LOGO = "\n".join(
         [
-            "     ██╗ █████╗ ███████╗███████╗       ██████╗ ██████╗ ██████╗ ███████╗",
-            "     ██║██╔══██╗╚══███╔╝╚══███╔╝      ██╔════╝██╔═══██╗██╔══██╗██╔════╝",
-            "     ██║███████║  ███╔╝   ███╔╝ █████╗██║     ██║   ██║██║  ██║█████╗",
-            "██   ██║██╔══██║ ███╔╝   ███╔╝  ╚════╝██║     ██║   ██║██║  ██║██╔══╝",
-            "╚█████╔╝██║  ██║███████╗███████╗      ╚██████╗╚██████╔╝██████╔╝███████╗",
-            " ╚════╝ ╚═╝  ╚═╝╚══════╝╚══════╝       ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝",
+            "                                                   ",
+            "██╗   ██╗ ██████╗ ██████╗ ████████╗███████╗██╗  ██╗",
+            "██║   ██║██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝ ",
+            "██║   ██║██║   ██║██████╔╝   ██║   █████╗   ╚███╔╝ ",
+            "╚██╗ ██╔╝██║   ██║██╔══██╗   ██║   ██╔══╝   ██╔██╗ ",
+            " ╚████╔╝ ╚██████╔╝██║  ██║   ██║   ███████╗██╔╝ ██╗",
+            "  ╚═══╝   ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝",
+            "                                                   ",
+            
         ]
     )
 
@@ -113,6 +121,12 @@ class TUI:
         self._tool_args_by_call_id: dict[str, dict[str, Any]] = {}
         self._max_block_tokens = 2500
         self._last_status: str | None = None
+        self._status_label = "thinking"
+        self._status_detail = ""
+        self._status_frame_index = 0
+        self._status_live: Live | None = None
+        self._supports_live_status = sys.stdout.isatty()
+        self._status_suspended = False
         self._prompt_session = None
 
         if (
@@ -124,6 +138,15 @@ class TUI:
             self._prompt_session = PromptSession(
                 history=InMemoryHistory(),
             )
+
+    def set_config(self, config: Config) -> None:
+        self.config = config
+        self.cwd = config.cwd
+
+    def _pause_live_status(self) -> None:
+        if self._status_live is not None:
+            self._status_live.stop()
+            self._status_live = None
 
     def _badge(self, label: str, style: str) -> Text:
         return Text(f" {label.upper()} ", style=style)
@@ -215,7 +238,33 @@ class TUI:
             ]
         )
 
+    def _workspace_prompt_message(self):
+        if FormattedText is None:
+            return None
+
+        return FormattedText(
+            [
+                ("", "\n"),
+                ("fg:#00e5e5", f"{self._WORKSPACE_PROMPT_LABEL} "),
+                ("fg:#555555", "› "),
+            ]
+        )
+
+    def _path_prompt_message(self):
+        if FormattedText is None:
+            return None
+
+        return FormattedText(
+            [
+                ("", "\n"),
+                ("fg:#00e5e5", "path "),
+                ("fg:#555555", "› "),
+            ]
+        )
+
     async def read_prompt(self) -> str:
+        self._pause_live_status()
+
         if self._prompt_session is not None:
             return await self._prompt_session.prompt_async(
                 self._prompt_message(),
@@ -224,7 +273,107 @@ class TUI:
 
         return self.console.input(self.prompt())
 
+    async def prompt_workspace_selection(
+        self,
+        *,
+        current_dir: Path,
+        fallback_dir: Path,
+        recent_workspaces: list[dict[str, str]],
+        current_label: str,
+    ) -> str:
+        table = Table(expand=True, box=None, padding=(0, 1))
+        table.add_column("#", style="meta.label", no_wrap=True)
+        table.add_column("Directory", style="meta.value")
+        table.add_column("Notes", style="muted")
+
+        options: list[tuple[str, str, str]] = [
+            ("1", self._home_relative(current_dir), current_label),
+        ]
+
+        if fallback_dir.resolve() != current_dir.resolve():
+            options.append(("2", self._home_relative(fallback_dir), "Default workspace"))
+
+        next_index = len(options) + 1
+        for entry in recent_workspaces[:5]:
+            path = entry.get("path", "")
+            if not path:
+                continue
+            if Path(path).resolve() in {current_dir.resolve(), fallback_dir.resolve()}:
+                continue
+            last_used = entry.get("last_used", "") or "recent"
+            options.append((str(next_index), self._home_relative(path), last_used))
+            next_index += 1
+
+        options.append(
+            (
+                str(next_index),
+                "Custom path...",
+                "Enter a project directory manually",
+            )
+        )
+
+        for index, directory, note in options:
+            table.add_row(index, directory, note)
+
+        self._pause_live_status()
+        self.console.print()
+        self.console.print(
+            self._panel(
+                Group(
+                    Text("Choose a working directory for this session.", style="muted"),
+                    Text(
+                        "Choose a number. Pick Custom path... to enter a project directory.",
+                        style="muted",
+                    ),
+                    table,
+                ),
+                title=Text.assemble(
+                    self._badge("CWD", "status.info.badge"),
+                    (" Workspace selection", "panel.title"),
+                ),
+            )
+        )
+
+        default_choice = "1"
+        if self._prompt_session is not None and PathCompleter is not None:
+            return await self._prompt_session.prompt_async(
+                self._workspace_prompt_message(),
+                default=default_choice,
+                completer=PathCompleter(expanduser=True, only_directories=True),
+                mouse_support=False,
+            )
+
+        return Prompt.ask(
+            "[meta.label]workspace[/meta.label] [prompt.hint]›[/prompt.hint]",
+            console=self.console,
+            default=default_choice,
+        )
+
+    async def prompt_custom_workspace_path(self, *, base_dir: Path) -> str:
+        self._pause_live_status()
+        self.console.print()
+        self.console.print(
+            Text(
+                f"Enter a project directory path. Relative paths resolve from {self._home_relative(base_dir)}.",
+                style="muted",
+            )
+        )
+
+        if self._prompt_session is not None and PathCompleter is not None:
+            return await self._prompt_session.prompt_async(
+                self._path_prompt_message(),
+                completer=PathCompleter(expanduser=True, only_directories=True),
+                mouse_support=False,
+            )
+
+        return Prompt.ask(
+            "[meta.label]path[/meta.label] [prompt.hint]›[/prompt.hint]",
+            console=self.console,
+            default="",
+        )
+
     def print_welcome(self) -> None:
+        self._pause_live_status()
         workspace = self._home_relative(self.config.cwd)
         rows = [
             ("model", self.config.model_name),
@@ -251,7 +400,7 @@ class TUI:
         self.console.print(Text(self._LOGO, style="brand"))
         self.console.print(
             Text(
-                "─── A LOCAL CODING AGENT  ·  TOOLS  ·  APPROVALS ───",
+                "─── VORTEX AGENT TERMINAL  ·  TOOLS  ·  APPROVALS ───",
                 style="muted",
             )
         )
@@ -262,7 +411,7 @@ class TUI:
         self.console.print(Text("commands", style="muted"))
         self.console.print(
             self._command_pills(
-                ["/help", "/scan", "/index", "/config", "/models", "/approval", "/model", "/exit"]
+                ["/help", "/scan", "/index", "/cwd", "/recent", "/config", "/models", "/approval", "/model", "/exit"]
             )
         )
         self.console.print()
@@ -271,10 +420,9 @@ class TUI:
         )
 
     def begin_assistant(self) -> None:
+        self._pause_live_status()
         title = Text()
-        title.append("assistant", style="muted")
-        title.append(" · ", style="dim")
-        title.append("Jazz-Code", style="assistant.badge")
+        title.append("vortex agent", style="assistant.badge")
 
         self.console.print()
         self.console.print(Rule(title, style="panel.border"))
@@ -401,7 +549,7 @@ class TUI:
             self.console.print(rendered, end="")
 
     def show_status(self, message: str) -> None:
-        if message == self._last_status:
+        if self._status_suspended:
             return
 
         label = "status"
@@ -412,19 +560,85 @@ class TUI:
                 label = prefix.strip()
                 detail = suffix.strip() or prefix.strip()
 
-        line = Text()
-        line.append(f"{self._PROMPT_MARKER} ", style="thinking.badge")
-        line.append(f"{label.lower()} › ", style="muted")
-        line.append(detail, style="thinking")
+        changed = (
+            message != self._last_status
+            or label.lower() != self._status_label
+            or detail != self._status_detail
+        )
+        self._last_status = message
+        self._status_label = label.lower()
+        self._status_detail = detail
+
+        if changed:
+            self._status_frame_index = 0
+
+        if self._supports_live_status:
+            if self._status_live is None:
+                self.console.print()
+                self._status_live = Live(
+                    self._render_status_line(),
+                    console=self.console,
+                    auto_refresh=False,
+                    transient=True,
+                )
+                self._status_live.start()
+
+            self._refresh_status_line()
+            return
+
+        if not changed:
+            return
 
         self.console.print()
-        self.console.print(line)
-        self._last_status = message
+        self.console.print(self._render_status_line())
+
+    def advance_status_frame(self) -> None:
+        if (
+            self._status_suspended
+            or not self._last_status
+            or not self._supports_live_status
+            or self._status_live is None
+        ):
+            return
+
+        self._status_frame_index = (self._status_frame_index + 1) % len(
+            self._STATUS_FRAMES
+        )
+        self._refresh_status_line()
+
+    def suspend_status(self) -> None:
+        self._status_suspended = True
+        self.clear_status()
+
+    def resume_status(self) -> None:
+        self._status_suspended = False
+
+    def _render_status_line(self) -> Text:
+        line = Text()
+        frame = self._STATUS_FRAMES[self._status_frame_index]
+        line.append(f"{frame} ", style="thinking.badge")
+        line.append(f"{self._status_label} › ", style="muted")
+        line.append(self._status_detail, style="thinking")
+        return line
+
+    def _refresh_status_line(self) -> None:
+        if self._status_live is None:
+            return
+
+        self._status_live.update(self._render_status_line(), refresh=True)
 
     def clear_status(self) -> None:
         self._last_status = None
+        self._status_label = "thinking"
+        self._status_detail = ""
+        self._status_frame_index = 0
+
+        if self._status_live is not None:
+            self._status_live.stop()
+            self._status_live = None
 
     def show_notice(self, message: str, level: str = "info") -> None:
+        self._pause_live_status()
         text_style = {
             "info": "info",
             "success": "success",
@@ -433,8 +647,8 @@ class TUI:
         }.get(level, "info")
 
         line = Text()
-        line.append(f"{self._PROMPT_MARKER} ", style="thinking.badge")
-        line.append(f"{level} › ", style="muted")
+        line.append_text(self._badge(level, f"status.{level}.badge"))
+        line.append(" ")
         line.append(message, style=text_style)
         self.console.print()
         self.console.print(line)
@@ -502,6 +716,7 @@ class TUI:
         tool_kind: str | None,
         arguments: dict[str, Any],
     ) -> None:
+        self._pause_live_status()
         self._tool_args_by_call_id[call_id] = arguments
         border_style = f"tool.{tool_kind}" if tool_kind else "tool"
 
@@ -614,6 +829,7 @@ class TUI:
         truncated: bool,
         exit_code: int | None,
     ) -> None:
+        self._pause_live_status()
         border_style = f"tool.{tool_kind}" if tool_kind else "tool"
         state = "done" if success else "failed"
         state_style = "status.success.badge" if success else "status.error.badge"
@@ -845,6 +1061,8 @@ class TUI:
         )
 
     def handle_confirmation(self, confirmation: ToolConfirmation) -> bool:
+        self.suspend_status()
+
         blocks: list[Any] = [
             Text(confirmation.tool_name, style="tool"),
             Text(confirmation.description, style="meta.value"),
@@ -876,13 +1094,16 @@ class TUI:
             )
         )
 
-        response = Prompt.ask(
-            "\nApprove?",
-            choices=["y", "n", "yes", "no"],
-            default="n",
-            console=self.console,
-        )
-        return response.lower() in {"y", "yes"}
+        try:
+            response = Prompt.ask(
+                "\nApprove?",
+                choices=["y", "n", "yes", "no"],
+                default="n",
+                console=self.console,
+            )
+            return response.lower() in {"y", "yes"}
+        finally:
+            self.resume_status()
 
     def show_config(self) -> None:
         base_url = self.config.base_url or "default"
@@ -1005,6 +1226,35 @@ class TUI:
             )
         )
 
+    def show_recent_workspaces(self, entries: list[dict[str, str]]) -> None:
+        self.console.print()
+
+        if not entries:
+            body = Text("No recent workspaces recorded yet.", style="muted")
+        else:
+            table = Table(expand=True, box=None, padding=(0, 1))
+            table.add_column("#", style="meta.label", no_wrap=True)
+            table.add_column("Directory", style="meta.value")
+            table.add_column("Last used", style="muted", no_wrap=True)
+
+            for index, entry in enumerate(entries, start=1):
+                table.add_row(
+                    str(index),
+                    self._home_relative(entry.get("path", "")),
+                    entry.get("last_used", ""),
+                )
+            body = table
+
+        self.console.print(
+            self._panel(
+                body,
+                title=Text.assemble(
+                    self._badge("Recent", "status.info.badge"),
+                    (" Recent workspaces", "panel.title"),
+                ),
+            )
+        )
+
     def show_stats(self, stats: dict[str, Any]) -> None:
         self.console.print()
         self.console.print(
@@ -1092,6 +1342,8 @@ class TUI:
         commands.add_row(Text("/clear"), "Clear conversation history")
         commands.add_row(Text("/scan"), "Refresh and show workspace context")
         commands.add_row(Text("/index"), "Refresh and show the codebase symbol index")
+        commands.add_row(Text("/cwd [path|index]"), "Switch to another project directory")
+        commands.add_row(Text("/recent"), "Show remembered workspaces")
         commands.add_row(Text("/config"), "Show current configuration")
         commands.add_row(Text("/models"), "List configured model profiles")
         commands.add_row(Text("/model <name>"), "Switch profile or change model name")
@@ -1110,6 +1362,7 @@ class TUI:
                 Text("Type a normal message to start an agent run.", style="muted"),
                 Text("Press Ctrl+C to stop the current run and return to the prompt.", style="muted"),
                 Text("Tool calls, approvals, and outputs are shown as structured cards.", style="muted"),
+                Text("Use /cwd to switch projects; the session reloads for the new directory.", style="muted"),
                 Text("Use /index or the find_symbol tool to jump to definitions faster.", style="muted"),
                 Text(
                     "Add custom providers in .ai-agent/config.toml with [models.<name>].",

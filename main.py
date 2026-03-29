@@ -18,6 +18,7 @@ from agent.session import Session
 from config.config import ApprovalPolicy, Config
 from config.loader import load_config
 from ui.tui import TUI, get_console
+from utils.workspace_history import WorkspaceHistoryManager
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -25,15 +26,136 @@ console = get_console()
 
 
 class CLI:
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        workspace_history: WorkspaceHistoryManager | None = None,
+    ):
         self.agent: Agent | None = None
         self.config = config
         self.tui = TUI(config, console)
         self._active_message_task: asyncio.Task[str | None] | None = None
+        self.workspace_history = workspace_history or WorkspaceHistoryManager()
 
     async def _reset_model_client(self) -> None:
         if self.agent and self.agent.session and self.agent.session.client:
             await self.agent.session.client.close()
+
+    async def _load_config_for_workspace(self, target: Path) -> Config:
+        target = _validate_workspace_directory(target)
+        config = load_config(cwd=target)
+        config.cwd = target
+
+        errors = config.validate()
+        if errors:
+            raise ValueError("\n".join(errors))
+
+        return config
+
+    async def _switch_workspace(self, target: Path) -> None:
+        if not self.agent:
+            return
+
+        target = target.expanduser().resolve()
+        if target == self.config.cwd.resolve():
+            self.tui.show_notice(
+                f"Already using working directory: {target}",
+                level="info",
+            )
+            return
+
+        new_config = await self._load_config_for_workspace(target)
+        new_session = Session(config=new_config)
+        new_session.approval_manager.confirmation_callback = self.tui.handle_confirmation
+
+        try:
+            await new_session.initialize()
+        except Exception:
+            with contextlib.suppress(Exception):
+                await new_session.client.close()
+            with contextlib.suppress(Exception):
+                await new_session.mcp_manager.shutdown()
+            raise
+
+        old_session = self.agent.session
+        self.config = new_config
+        self.agent.config = new_config
+        self.agent.session = new_session
+        self.tui.set_config(new_config)
+        self.workspace_history.record(new_config.cwd)
+
+        if old_session:
+            with contextlib.suppress(Exception):
+                await old_session.client.close()
+            with contextlib.suppress(Exception):
+                await old_session.mcp_manager.shutdown()
+
+        self.tui.show_notice(
+            f"Switched working directory to: {new_config.cwd}",
+            level="success",
+        )
+        self.tui.show_workspace_snapshot(new_session.workspace_snapshot)
+        self.tui.show_code_index(new_session.code_index_summary)
+
+    async def _prompt_custom_workspace(self, *, base_dir: Path) -> Path | None:
+        while True:
+            custom_input = (
+                await self.tui.prompt_custom_workspace_path(base_dir=base_dir)
+            ).strip()
+            if not custom_input:
+                return None
+
+            try:
+                return _validate_workspace_directory(
+                    _resolve_workspace_path(custom_input, base_dir)
+                )
+            except ValueError as exc:
+                self.tui.show_notice(str(exc), level="error")
+                self.tui.show_notice(
+                    "Enter another path or press Enter to cancel.",
+                    level="info",
+                )
+
+    async def _prompt_for_workspace(
+        self,
+        *,
+        current_dir: Path,
+        fallback_dir: Path,
+        current_label: str,
+    ) -> Path | None:
+        recent = self.workspace_history.list_recent()
+        choice = (
+            await self.tui.prompt_workspace_selection(
+                current_dir=current_dir,
+                fallback_dir=fallback_dir,
+                recent_workspaces=recent,
+                current_label=current_label,
+            )
+        ).strip()
+
+        if not choice:
+            choice = "1"
+
+        option_map, custom_index = _build_workspace_option_map(
+            current_dir=current_dir,
+            fallback_dir=fallback_dir,
+            recent_workspaces=recent,
+        )
+
+        if choice.isdigit():
+            selected_index = int(choice) - 1
+            if selected_index == custom_index - 1:
+                return await self._prompt_custom_workspace(base_dir=current_dir)
+            if 0 <= selected_index < len(option_map):
+                return option_map[selected_index]
+            return None
+
+        try:
+            return _validate_workspace_directory(
+                _resolve_workspace_path(choice, current_dir)
+            )
+        except ValueError:
+            return None
 
     async def _stop_active_run(self) -> bool:
         had_active_task = self._active_message_task is not None
@@ -116,6 +238,7 @@ class CLI:
 
         assistant_streaming = False
         final_response: str | None = None
+        status_animation_task = asyncio.create_task(self._animate_status())
 
         try:
             async for event in self.agent.run(message):
@@ -128,6 +251,7 @@ class CLI:
                 elif event.type == AgentEventType.TEXT_DELTA:
                     content = event.data.get("content", "")
                     if not assistant_streaming:
+                        self.tui.clear_status()
                         self.tui.begin_assistant()
                         assistant_streaming = True
                     self.tui.stream_assistant_delta(content)
@@ -170,34 +294,85 @@ class CLI:
                 self.tui.end_assistant()
             self.tui.clear_status()
             raise
+        finally:
+            status_animation_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await status_animation_task
 
         return final_response
 
+    async def _animate_status(self) -> None:
+        while True:
+            await asyncio.sleep(0.12)
+            self.tui.advance_status_frame()
+
     async def _handle_command(self, command: str) -> bool:
-        cmd = command.lower().strip()
-        parts = cmd.split(maxsplit=1)
+        raw_command = command.strip()
+        parts = raw_command.split(maxsplit=1)
         cmd_name = parts[0]
-        cmd_args = parts[1] if len(parts) > 1 else ""
-        if cmd_name == "/exit" or cmd_name == "/quit":
+        cmd_args = parts[1].strip() if len(parts) > 1 else ""
+        cmd_name_lower = cmd_name.lower()
+        if cmd_name_lower == "/exit" or cmd_name_lower == "/quit":
             return False
-        elif command == "/help":
+        elif cmd_name_lower == "/help":
             self.tui.show_help()
-        elif command == "/clear":
+        elif cmd_name_lower == "/clear":
             self.agent.session.context_manager.clear()
             self.agent.session.loop_detector.clear()
             self.tui.show_notice("Conversation cleared.", level="success")
-        elif command == "/scan":
+        elif cmd_name_lower == "/scan":
             snapshot, code_index = self.agent.session.refresh_workspace_context()
             self.tui.show_workspace_snapshot(snapshot)
             self.tui.show_code_index(code_index)
-        elif command == "/index":
+        elif cmd_name_lower == "/index":
             summary = self.agent.session.refresh_code_index()
             self.tui.show_code_index(summary)
-        elif command == "/config":
+        elif cmd_name_lower == "/cwd":
+            if cmd_args:
+                target = cmd_args
+                recent = self.workspace_history.list_recent()
+                if target.isdigit():
+                    index = int(target) - 1
+                    if 0 <= index < len(recent):
+                        target_path = Path(recent[index]["path"])
+                    else:
+                        self.tui.show_notice(
+                            f"No recent workspace at index {target}.",
+                            level="error",
+                        )
+                        return True
+                else:
+                    target_path = Path(target).expanduser()
+                    if not target_path.is_absolute():
+                        target_path = (self.config.cwd / target_path).resolve()
+
+                try:
+                    await self._switch_workspace(target_path)
+                except Exception as exc:
+                    self.tui.show_notice(f"Failed to switch workspace: {exc}", level="error")
+            else:
+                selected = await self._prompt_for_workspace(
+                    current_dir=self.config.cwd,
+                    fallback_dir=WORKSPACE,
+                    current_label="Current project",
+                )
+                if not selected:
+                    self.tui.show_notice("Invalid workspace selection.", level="error")
+                else:
+                    try:
+                        await self._switch_workspace(selected)
+                    except Exception as exc:
+                        self.tui.show_notice(
+                            f"Failed to switch workspace: {exc}",
+                            level="error",
+                        )
+        elif cmd_name_lower == "/recent":
+            self.tui.show_recent_workspaces(self.workspace_history.list_recent())
+        elif cmd_name_lower == "/config":
             self.tui.show_config()
-        elif cmd_name == "/models":
+        elif cmd_name_lower == "/models":
             self.tui.show_model_profiles(self.config)
-        elif cmd_name == "/model":
+        elif cmd_name_lower == "/model":
             if cmd_args:
                 target = cmd_args.strip()
                 profile_name = None
@@ -243,7 +418,7 @@ class CLI:
                     ),
                     level="info",
                 )
-        elif cmd_name == "/approval":
+        elif cmd_name_lower == "/approval":
             if cmd_args:
                 try:
                     approval = ApprovalPolicy(cmd_args)
@@ -267,16 +442,16 @@ class CLI:
                     f"Current approval policy: {self.config.approval.value}",
                     level="info",
                 )
-        elif cmd_name == "/stats":
+        elif cmd_name_lower == "/stats":
             stats = self.agent.session.get_stats()
             self.tui.show_stats(stats)
-        elif cmd_name == "/tools":
+        elif cmd_name_lower == "/tools":
             tools = self.agent.session.tool_registry.get_tools()
             self.tui.show_tools(tools)
-        elif cmd_name == "/mcp":
+        elif cmd_name_lower == "/mcp":
             mcp_servers = self.agent.session.mcp_manager.get_all_servers()
             self.tui.show_mcp_servers(mcp_servers)
-        elif cmd_name == "/save":
+        elif cmd_name_lower == "/save":
             persistence_manager = PersistenceManager()
             session_snapshot = SessionSnapshot(
                 session_id=self.agent.session.session_id,
@@ -291,11 +466,11 @@ class CLI:
                 f"Session saved: {self.agent.session.session_id}",
                 level="success",
             )
-        elif cmd_name == "/sessions":
+        elif cmd_name_lower == "/sessions":
             persistence_manager = PersistenceManager()
             sessions = persistence_manager.list_sessions()
             self.tui.show_saved_sessions(sessions, "Saved sessions")
-        elif cmd_name == "/resume":
+        elif cmd_name_lower == "/resume":
             if not cmd_args:
                 self.tui.show_notice(
                     "Usage: /resume <session_id>",
@@ -341,7 +516,7 @@ class CLI:
                         f"Resumed session: {session.session_id}",
                         level="success",
                     )
-        elif cmd_name == "/checkpoint":
+        elif cmd_name_lower == "/checkpoint":
             persistence_manager = PersistenceManager()
             session_snapshot = SessionSnapshot(
                 session_id=self.agent.session.session_id,
@@ -356,7 +531,7 @@ class CLI:
                 f"Checkpoint created: {checkpoint_id}",
                 level="success",
             )
-        elif cmd_name == "/restore":
+        elif cmd_name_lower == "/restore":
             if not cmd_args:
                 self.tui.show_notice(
                     "Usage: /restore <checkpoint_id>",
@@ -408,6 +583,130 @@ class CLI:
         return True
 
 
+def _load_validated_config(requested_cwd: Path) -> Config:
+    validated_cwd = _validate_workspace_directory(requested_cwd)
+    config = load_config(cwd=validated_cwd)
+    config.cwd = validated_cwd
+    errors = config.validate()
+    if errors:
+        raise ValueError("\n".join(errors))
+    return config
+
+
+def _resolve_workspace_path(path_input: str, base_dir: Path) -> Path:
+    candidate = Path(path_input).expanduser()
+    if not candidate.is_absolute():
+        candidate = (base_dir / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    return candidate
+
+
+def _validate_workspace_directory(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        raise ValueError(f"Directory does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"Path is not a directory: {resolved}")
+    return resolved
+
+
+def _build_workspace_option_map(
+    *,
+    current_dir: Path,
+    fallback_dir: Path,
+    recent_workspaces: list[dict[str, str]],
+) -> tuple[list[Path], int]:
+    option_map: list[Path] = [current_dir.resolve()]
+    if fallback_dir.resolve() != current_dir.resolve():
+        option_map.append(fallback_dir.resolve())
+
+    for entry in recent_workspaces[:5]:
+        path_text = entry.get("path")
+        if not path_text:
+            continue
+        path = Path(path_text).resolve()
+        if path in option_map:
+            continue
+        option_map.append(path)
+
+    custom_index = len(option_map) + 1
+    return option_map, custom_index
+
+
+def _choose_startup_workspace(
+    *,
+    prompt: str | None,
+    requested_cwd: Path | None,
+    workspace_history: WorkspaceHistoryManager,
+) -> Path:
+    if requested_cwd is not None:
+        return _validate_workspace_directory(requested_cwd)
+
+    latest_workspace = workspace_history.latest()
+
+    if prompt is not None:
+        return (latest_workspace or WORKSPACE).resolve()
+
+    temp_config = Config(cwd=latest_workspace or Path.cwd().resolve())
+    selector_tui = TUI(temp_config, console)
+    current_dir = Path.cwd().resolve()
+    recent_workspaces = workspace_history.list_recent()
+    option_map, custom_index = _build_workspace_option_map(
+        current_dir=current_dir,
+        fallback_dir=WORKSPACE.resolve(),
+        recent_workspaces=recent_workspaces,
+    )
+
+    while True:
+        selected = asyncio.run(
+            selector_tui.prompt_workspace_selection(
+                current_dir=current_dir,
+                fallback_dir=WORKSPACE.resolve(),
+                recent_workspaces=recent_workspaces,
+                current_label="Current shell directory",
+            )
+        ).strip()
+
+        if not selected:
+            selected = "1"
+
+        if selected.isdigit():
+            index = int(selected) - 1
+            if index == custom_index - 1:
+                custom_input = asyncio.run(
+                    selector_tui.prompt_custom_workspace_path(base_dir=current_dir)
+                ).strip()
+                if not custom_input:
+                    continue
+                try:
+                    return _validate_workspace_directory(
+                        _resolve_workspace_path(custom_input, current_dir)
+                    )
+                except ValueError as exc:
+                    selector_tui.show_notice(str(exc), level="error")
+                    selector_tui.show_notice(
+                        "Choose another directory or press Enter to go back.",
+                        level="info",
+                    )
+                    continue
+
+            if 0 <= index < len(option_map):
+                return option_map[index]
+            raise ValueError("Invalid workspace selection.")
+
+        try:
+            return _validate_workspace_directory(
+                _resolve_workspace_path(selected, current_dir)
+            )
+        except ValueError as exc:
+            selector_tui.show_notice(str(exc), level="error")
+            selector_tui.show_notice(
+                "Choose another directory or pick Custom path...",
+                level="info",
+            )
+
+
 @click.command()
 @click.argument("prompt", required=False)
 @click.option(
@@ -420,25 +719,21 @@ def main(
     prompt: str | None,
     cwd: Path | None,
 ):
-    requested_cwd = (cwd or WORKSPACE).resolve()
+    workspace_history = WorkspaceHistoryManager()
 
     try:
-        config = load_config(cwd=requested_cwd)
+        requested_cwd = _choose_startup_workspace(
+            prompt=prompt,
+            requested_cwd=cwd,
+            workspace_history=workspace_history,
+        )
+        config = _load_validated_config(requested_cwd)
     except Exception as e:
         console.print(f"[error]Configuration Error: {e}[/error]")
         sys.exit(1)
 
-    config.cwd = requested_cwd
-
-    errors = config.validate()
-
-    if errors:
-        for error in errors:
-            console.print(f"[error]{error}[/error]")
-
-        sys.exit(1)
-
-    cli = CLI(config)
+    workspace_history.record(requested_cwd)
+    cli = CLI(config, workspace_history=workspace_history)
 
     # messages = [{"role": "user", "content": prompt}]
     if prompt:
