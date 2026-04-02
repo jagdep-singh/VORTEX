@@ -6,3 +6,4 @@ workspace/
 build/
 dist/
 *.egg-info/
+.ai-agent/READ_ONLY_FOR_AGENT.md
