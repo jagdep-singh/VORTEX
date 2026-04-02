@@ -1,12 +1,12 @@
 import asyncio
-from collections import Counter
 import contextlib
+import hashlib
 import os
 from pathlib import Path
 import sys
 
 import click
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORKSPACE = PROJECT_ROOT / "workspace"
@@ -20,22 +20,27 @@ from agent.session import Session
 from config.config import ApprovalPolicy, Config
 from config.loader import load_config
 from ui.tui import TUI, get_console
-from utils.model_catalog import load_model_catalog
-from utils.model_health import (
-    ModelHealthChecker,
-    ModelHealthRecord,
-    ModelHealthStore,
-    classify_error_text,
+from utils.model_discovery import (
+    ModelCatalogEntry,
+    ModelCatalogResult,
+    ModelCatalogStore,
+    build_model_catalog_sources,
+    discover_model_catalog,
+    flatten_model_catalog,
 )
 from utils.workspace_history import WorkspaceHistoryManager
 
-load_dotenv(PROJECT_ROOT / ".env")
+
+def _load_env_file(path: Path | None) -> None:
+    if path is None:
+        return
+    load_dotenv(path, override=False)
+
+
+_load_env_file(PROJECT_ROOT / ".env")
+_load_env_file(Path.cwd() / ".env")
 
 console = get_console()
-APP_MODEL_CATALOG_PATH = PROJECT_ROOT / ".ai-agent/models.txt"
-OPENROUTER_PROFILE_NAME = "openrouter"
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 
 
 class CLI:
@@ -49,7 +54,9 @@ class CLI:
         self.tui = TUI(config, console)
         self._active_message_task: asyncio.Task[str | None] | None = None
         self.workspace_history = workspace_history or WorkspaceHistoryManager()
-        self.model_health_store = ModelHealthStore()
+        self._model_catalog_store = ModelCatalogStore()
+        self._model_catalog_results: list[ModelCatalogResult] | None = None
+        self._model_catalog_signature: tuple[tuple[str, str, str, str], ...] | None = None
 
     async def _reset_model_client(self) -> None:
         if self.agent and self.agent.session and self.agent.session.client:
@@ -58,7 +65,6 @@ class CLI:
     async def _load_config_for_workspace(self, target: Path) -> Config:
         target = _validate_workspace_directory(target)
         config = load_config(cwd=target)
-        _attach_model_catalog(config, target)
         config.cwd = target
 
         errors = config.validate()
@@ -98,6 +104,7 @@ class CLI:
         self.agent.session = new_session
         self.tui.set_config(new_config)
         self.workspace_history.record(new_config.cwd)
+        self._invalidate_model_catalog()
 
         if old_session:
             with contextlib.suppress(Exception):
@@ -191,127 +198,155 @@ class CLI:
 
         return False
 
-    def _catalog_health_records(self) -> dict[str, ModelHealthRecord]:
-        return self.model_health_store.get_many(
-            OPENROUTER_PROFILE_NAME,
-            self.config.list_catalog_models(),
-        )
+    def _invalidate_model_catalog(self) -> None:
+        self._model_catalog_results = None
+        self._model_catalog_signature = None
 
-    def _is_openrouter_catalog_model(self, model_name: str | None = None) -> bool:
-        candidate = model_name or self.config.model_name
-        return (
-            self.config.active_model_profile == OPENROUTER_PROFILE_NAME
-            and candidate in self.config.list_catalog_models()
-        )
+    def _current_catalog_signature(self) -> tuple[tuple[str, str, str, str], ...]:
+        signature: list[tuple[str, str, str, str]] = []
 
-    def _record_catalog_model_health(
+        for source in build_model_catalog_sources(self.config):
+            signature.append(
+                (
+                    source.profile_name or "",
+                    source.base_url,
+                    source.key_source_label,
+                    hashlib.sha256((source.api_key or "").encode("utf-8")).hexdigest(),
+                )
+            )
+
+        return tuple(signature)
+
+    def _cached_model_catalog_entries(self) -> list[ModelCatalogEntry]:
+        if not self._model_catalog_results:
+            return []
+        return flatten_model_catalog(self._model_catalog_results)
+
+    async def _get_model_catalog(
         self,
         *,
-        model_name: str,
-        status: str,
-        detail: str | None = None,
-    ) -> None:
-        self.model_health_store.save_record(
-            ModelHealthRecord.create(
-                provider=OPENROUTER_PROFILE_NAME,
-                model=model_name,
-                status=status,
-                detail=detail,
+        refresh: bool = False,
+    ) -> list[ModelCatalogResult]:
+        signature = self._current_catalog_signature()
+        if (
+            not refresh
+            and self._model_catalog_results is not None
+            and self._model_catalog_signature == signature
+        ):
+            return self._model_catalog_results
+
+        self.tui.show_status("Loading models from configured providers...")
+        try:
+            live_results = await discover_model_catalog(self.config)
+        finally:
+            self.tui.clear_status()
+
+        results: list[ModelCatalogResult] = []
+        cached_sources: list[str] = []
+        for result in live_results:
+            if result.error:
+                cached_result = self._model_catalog_store.get(result.source)
+                if cached_result is not None:
+                    cached_result.error = result.error
+                    results.append(cached_result)
+                    cached_sources.append(result.source.display_name)
+                    continue
+
+                results.append(result)
+                continue
+
+            self._model_catalog_store.save(result)
+            results.append(result)
+
+        self._model_catalog_results = results
+        self._model_catalog_signature = signature
+
+        if cached_sources:
+            self.tui.show_notice(
+                "Using cached model list for: " + ", ".join(cached_sources),
+                level="warning",
             )
-        )
 
-    async def _refresh_catalog_model_health(self) -> None:
-        catalog_models = self.config.list_catalog_models()
-        if not catalog_models:
-            self.tui.show_notice("No catalog models are available to check.", level="info")
-            return
+        return results
 
-        profile = _ensure_openrouter_profile(self.config)
-        checker = ModelHealthChecker(
-            provider=OPENROUTER_PROFILE_NAME,
-            base_url=profile.base_url or OPENROUTER_BASE_URL,
-            api_key=profile.resolved_api_key or profile.api_key,
-            store=self.model_health_store,
-        )
+    def _select_preferred_catalog_entry(
+        self,
+        matches: list[ModelCatalogEntry],
+    ) -> ModelCatalogEntry:
+        for entry in matches:
+            if entry.profile_name == self.config.active_model_profile:
+                return entry
 
-        async def on_progress(index: int, total: int, record: ModelHealthRecord) -> None:
-            self.tui.show_status(
-                f"Checking models {index}/{total}: {record.model}"
-            )
+        for entry in matches:
+            if entry.profile_name is None and self.config.active_model_profile is None:
+                return entry
 
-        self.tui.show_status("Checking catalog model availability...")
-        records = await checker.probe_models(
-            catalog_models,
-            progress_callback=on_progress,
-        )
-        self.tui.clear_status()
-
-        counts = Counter(record.status for record in records)
-        working = counts.get("working", 0)
-        blocked = len(records) - working
-        notice_level = "success" if blocked == 0 else "warning"
-        self.tui.show_notice(
-            f"Checked {len(records)} models: {working} working, {blocked} not ready.",
-            level=notice_level,
-        )
+        return matches[0]
 
     async def run_single(self, message: str) -> str | None:
-        async with Agent(self.config) as agent:
-            self.agent = agent
-            return await self._process_message(message)
+        try:
+            async with Agent(self.config) as agent:
+                self.agent = agent
+                return await self._process_message(message)
+        finally:
+            self.tui.clear_status()
 
     async def run_interactive(self) -> str | None:
         self.tui.print_welcome()
 
-        async with Agent(
-            self.config,
-            confirmation_callback=self.tui.handle_confirmation,
-        ) as agent:
-            self.agent = agent
+        try:
+            async with Agent(
+                self.config,
+                confirmation_callback=self.tui.handle_confirmation,
+            ) as agent:
+                self.agent = agent
 
-            while True:
-                try:
-                    user_input = (await self.tui.read_prompt()).strip()
-                    if not user_input:
-                        continue
+                while True:
+                    try:
+                        user_input = (await self.tui.read_prompt()).strip()
+                        if not user_input:
+                            continue
 
-                    if user_input.isdigit():
-                        selected_index = int(user_input)
-                        if 1 <= selected_index <= len(self.config.list_catalog_models()):
-                            should_continue = await self._handle_command(
-                                f"/model {user_input}"
-                            )
+                        if user_input.isdigit():
+                            catalog_entries = self._cached_model_catalog_entries()
+                            selected_index = int(user_input)
+                            if 1 <= selected_index <= len(catalog_entries):
+                                should_continue = await self._handle_command(
+                                    f"/model {user_input}"
+                                )
+                                if not should_continue:
+                                    break
+                                continue
+
+                        if user_input.startswith("/"):
+                            should_continue = await self._handle_command(user_input)
                             if not should_continue:
                                 break
                             continue
 
-                    if user_input.startswith("/"):
-                        should_continue = await self._handle_command(user_input)
-                        if not should_continue:
-                            break
-                        continue
-
-                    self._active_message_task = asyncio.create_task(
-                        self._process_message(user_input)
-                    )
-                    try:
-                        await self._active_message_task
-                    except asyncio.CancelledError:
-                        current_task = asyncio.current_task()
-                        if current_task is not None:
-                            current_task.uncancel()
-                        await self._stop_active_run()
-                    finally:
-                        self._active_message_task = None
-                except KeyboardInterrupt:
-                    stopped = await self._stop_active_run()
-                    if not stopped:
-                        self.tui.show_notice(
-                            "Press Ctrl+C to stop a run or use /exit to quit.",
-                            level="info",
+                        self._active_message_task = asyncio.create_task(
+                            self._process_message(user_input)
                         )
-                except EOFError:
-                    break
+                        try:
+                            await self._active_message_task
+                        except asyncio.CancelledError:
+                            current_task = asyncio.current_task()
+                            if current_task is not None:
+                                current_task.uncancel()
+                            await self._stop_active_run()
+                        finally:
+                            self._active_message_task = None
+                    except KeyboardInterrupt:
+                        stopped = await self._stop_active_run()
+                        if not stopped:
+                            self.tui.show_notice(
+                                "Press Ctrl+C to stop a run or use /exit to quit.",
+                                level="info",
+                            )
+                    except EOFError:
+                        break
+        finally:
+            self.tui.clear_status()
 
         self.tui.show_notice("Goodbye!", level="info")
 
@@ -328,7 +363,6 @@ class CLI:
         assistant_streaming = False
         final_response: str | None = None
         status_animation_task = asyncio.create_task(self._animate_status())
-        current_model_name = self.config.model_name
 
         try:
             async for event in self.agent.run(message):
@@ -353,13 +387,6 @@ class CLI:
                     self.tui.clear_status()
                 elif event.type == AgentEventType.AGENT_ERROR:
                     error = event.data.get("error", "Unknown error")
-                    if self._is_openrouter_catalog_model(current_model_name):
-                        status, detail = classify_error_text(error)
-                        self._record_catalog_model_health(
-                            model_name=current_model_name,
-                            status=status,
-                            detail=detail,
-                        )
                     self.tui.clear_status()
                     self.tui.show_notice(f"Error: {error}", level="error")
                 elif event.type == AgentEventType.TOOL_CALL_START:
@@ -395,12 +422,6 @@ class CLI:
             status_animation_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await status_animation_task
-
-        if final_response is not None and self._is_openrouter_catalog_model(current_model_name):
-            self._record_catalog_model_health(
-                model_name=current_model_name,
-                status="working",
-            )
 
         return final_response
 
@@ -475,17 +496,19 @@ class CLI:
             self.tui.show_config()
         elif cmd_name_lower == "/models":
             action = cmd_args.strip().lower()
-            if action in {"refresh", "check"}:
-                await self._refresh_catalog_model_health()
+            if action == "refresh":
+                model_catalog = await self._get_model_catalog(refresh=True)
             elif action:
                 self.tui.show_notice(
                     "Usage: /models or /models refresh",
                     level="error",
                 )
                 return True
+            else:
+                model_catalog = await self._get_model_catalog()
             self.tui.show_model_profiles(
                 self.config,
-                model_health=self._catalog_health_records(),
+                model_catalog=model_catalog,
             )
         elif cmd_name_lower == "/model":
             if cmd_args:
@@ -521,35 +544,40 @@ class CLI:
                     except ValueError as exc:
                         self.tui.show_notice(str(exc), level="error")
                 elif target.isdigit():
-                    catalog_models = self.config.list_catalog_models()
+                    catalog_models = flatten_model_catalog(
+                        await self._get_model_catalog()
+                    )
                     selected_index = int(target) - 1
                     if 0 <= selected_index < len(catalog_models):
-                        selected_model = catalog_models[selected_index]
-                        await self._switch_to_catalog_model(
-                            selected_model,
-                            force=force_switch,
+                        await self._switch_to_catalog_entry(
+                            catalog_models[selected_index]
                         )
                     else:
                         self.tui.show_notice(
-                            f"No catalog model at index {target}.",
+                            f"No discovered model at index {target}.",
                             level="error",
                         )
                         self.tui.show_notice(
-                            "Use /models to inspect the available catalog entries.",
+                            "Use /models to inspect the discovered model list.",
                             level="info",
                         )
-                elif target in self.config.list_catalog_models():
-                    await self._switch_to_catalog_model(
-                        target,
-                        force=force_switch,
-                    )
                 else:
-                    self.config.model_name = target
-                    await self._reset_model_client()
-                    self.tui.show_notice(
-                        f"Model changed to: {target}",
-                        level="success",
-                    )
+                    matches = [
+                        entry
+                        for entry in self._cached_model_catalog_entries()
+                        if entry.model_name == target
+                    ]
+                    if matches and not force_switch:
+                        await self._switch_to_catalog_entry(
+                            self._select_preferred_catalog_entry(matches)
+                        )
+                    else:
+                        self.config.model_name = target
+                        await self._reset_model_client()
+                        self.tui.show_notice(
+                            f"Model changed to: {target}",
+                            level="success",
+                        )
             else:
                 self.tui.show_notice(
                     "Current model: "
@@ -725,48 +753,32 @@ class CLI:
 
         return True
 
-    async def _switch_to_catalog_model(self, model_name: str, *, force: bool = False) -> None:
-        _ensure_openrouter_profile(self.config)
-
-        if not force:
-            health_record = self.model_health_store.get(OPENROUTER_PROFILE_NAME, model_name)
-            if health_record is None:
-                self.tui.show_notice(
-                    f"Model status for '{model_name}' is unknown.",
-                    level="warning",
-                )
-                self.tui.show_notice(
-                    "Run /models refresh first, or use /model force <name|number> to override.",
-                    level="info",
-                )
-                return
-
-            if health_record.status != "working":
-                self.tui.show_notice(
-                    f"Model '{model_name}' is currently marked {health_record.status}.",
-                    level="error",
-                )
-                if health_record.detail:
-                    self.tui.show_notice(health_record.detail, level="info")
-                self.tui.show_notice(
-                    "Run /models refresh later, or use /model force <name|number> if you still want to try it.",
-                    level="info",
-                )
-                return
-
-        self.config.switch_model_profile(OPENROUTER_PROFILE_NAME)
-        self.config.model_name = model_name
+    async def _switch_to_catalog_entry(self, entry: ModelCatalogEntry) -> None:
+        self.config.active_model_profile = entry.profile_name
+        self.config.model_name = entry.model_name
         await self._reset_model_client()
 
         if self.config.api_key:
             self.tui.show_notice(
-                f"Model changed to: {model_name} via profile '{OPENROUTER_PROFILE_NAME}'",
+                "Model changed to: "
+                f"{entry.model_name}"
+                + (
+                    f" via profile '{entry.display_name}'"
+                    if entry.profile_name is not None
+                    else ""
+                ),
                 level="success",
             )
         else:
             self.tui.show_notice(
-                f"Switched to '{model_name}' via profile '{OPENROUTER_PROFILE_NAME}', "
-                "but no OpenRouter API key is currently resolved.",
+                "Switched to "
+                f"'{entry.model_name}'"
+                + (
+                    f" via profile '{entry.display_name}'"
+                    if entry.profile_name is not None
+                    else ""
+                )
+                + ", but no API key is currently resolved for it.",
                 level="warning",
             )
 
@@ -774,7 +786,6 @@ class CLI:
 def _load_validated_config(requested_cwd: Path) -> Config:
     validated_cwd = _validate_workspace_directory(requested_cwd)
     config = load_config(cwd=validated_cwd)
-    _attach_model_catalog(config, validated_cwd)
     config.cwd = validated_cwd
     errors = config.validate()
     if errors:
@@ -782,39 +793,75 @@ def _load_validated_config(requested_cwd: Path) -> Config:
     return config
 
 
-def _attach_model_catalog(config: Config, target_cwd: Path) -> None:
-    project_catalog_path = target_cwd.resolve() / ".ai-agent/models.txt"
-    config.model_catalog = load_model_catalog(
-        [APP_MODEL_CATALOG_PATH, project_catalog_path]
-    )
+@contextlib.contextmanager
+def _temporary_workspace_env(cwd: Path):
+    env_path = cwd / ".env"
+    if not env_path.is_file():
+        yield
+        return
+
+    env_values = {
+        key: value
+        for key, value in dotenv_values(env_path).items()
+        if value is not None and key not in os.environ
+    }
+
+    if not env_values:
+        yield
+        return
+
+    os.environ.update(env_values)
+    try:
+        yield
+    finally:
+        for key in env_values:
+            os.environ.pop(key, None)
 
 
-def _resolve_openrouter_api_key(config: Config) -> str | None:
-    profile = config.get_model_profile(OPENROUTER_PROFILE_NAME)
-    if profile:
-        resolved = profile.resolved_api_key or profile.api_key
-        if resolved:
-            return resolved
+def _validate_startup_workspace_choice(candidate: Path) -> str | None:
+    try:
+        validated_cwd = _validate_workspace_directory(candidate)
+    except ValueError as exc:
+        return str(exc)
 
-    openrouter_env_key = os.environ.get(OPENROUTER_API_KEY_ENV)
-    if openrouter_env_key:
-        return openrouter_env_key
-
-    global_key = os.environ.get("API_KEY")
-    global_base_url = (os.environ.get("BASE_URL") or "").lower()
-    if global_key and "openrouter.ai" in global_base_url:
-        return global_key
+    try:
+        with _temporary_workspace_env(validated_cwd):
+            _load_validated_config(validated_cwd)
+    except Exception as exc:
+        return str(exc)
 
     return None
 
 
-def _ensure_openrouter_profile(config: Config):
-    return config.ensure_model_profile(
-        OPENROUTER_PROFILE_NAME,
-        base_url=OPENROUTER_BASE_URL,
-        api_key=_resolve_openrouter_api_key(config),
-        api_key_env=OPENROUTER_API_KEY_ENV,
+def _prompt_startup_custom_workspace(
+    *,
+    selector_tui: TUI,
+    base_dir: Path,
+) -> Path | None:
+    error_message: str | None = None
+    info_message = (
+        "Enter any absolute path, ~/ path, or path relative to the current shell directory."
     )
+
+    while True:
+        custom_input = asyncio.run(
+            selector_tui.prompt_custom_workspace_path(
+                base_dir=base_dir,
+                error_message=error_message,
+                info_message=info_message,
+            )
+        ).strip()
+
+        if not custom_input:
+            return None
+
+        try:
+            return _validate_workspace_directory(
+                _resolve_workspace_path(custom_input, base_dir)
+            )
+        except ValueError as exc:
+            error_message = str(exc)
+            info_message = "Enter another directory path or press Enter to go back."
 
 
 def _resolve_workspace_path(path_input: str, base_dir: Path) -> Path:
@@ -881,6 +928,10 @@ def _choose_startup_workspace(
         fallback_dir=WORKSPACE.resolve(),
         recent_workspaces=recent_workspaces,
     )
+    error_message: str | None = None
+    info_message = (
+        "Choose one of the listed workspaces or enter a directory path directly."
+    )
 
     while True:
         selected = asyncio.run(
@@ -889,8 +940,12 @@ def _choose_startup_workspace(
                 fallback_dir=WORKSPACE.resolve(),
                 recent_workspaces=recent_workspaces,
                 current_label="Current shell directory",
+                error_message=error_message,
+                info_message=info_message,
             )
         ).strip()
+        error_message = None
+        info_message = None
 
         if not selected:
             selected = "1"
@@ -898,37 +953,63 @@ def _choose_startup_workspace(
         if selected.isdigit():
             index = int(selected) - 1
             if index == custom_index - 1:
-                custom_input = asyncio.run(
-                    selector_tui.prompt_custom_workspace_path(base_dir=current_dir)
-                ).strip()
-                if not custom_input:
-                    continue
-                try:
-                    return _validate_workspace_directory(
-                        _resolve_workspace_path(custom_input, current_dir)
-                    )
-                except ValueError as exc:
-                    selector_tui.show_notice(str(exc), level="error")
-                    selector_tui.show_notice(
-                        "Choose another directory or press Enter to go back.",
-                        level="info",
+                custom_path = _prompt_startup_custom_workspace(
+                    selector_tui=selector_tui,
+                    base_dir=current_dir,
+                )
+                if custom_path is None:
+                    info_message = (
+                        "Choose one of the listed workspaces or enter a directory path directly."
                     )
                     continue
+
+                validation_error = _validate_startup_workspace_choice(custom_path)
+                if validation_error:
+                    error_message = validation_error
+                    info_message = (
+                        "Fix that workspace configuration or choose another directory."
+                    )
+                    continue
+
+                selector_tui.clear_screen()
+                return custom_path.resolve()
 
             if 0 <= index < len(option_map):
-                return option_map[index]
-            raise ValueError("Invalid workspace selection.")
+                selected_path = option_map[index]
+                validation_error = _validate_startup_workspace_choice(selected_path)
+                if validation_error:
+                    error_message = validation_error
+                    info_message = (
+                        "Fix that workspace configuration or choose another directory."
+                    )
+                    continue
+
+                selector_tui.clear_screen()
+                return selected_path.resolve()
+
+            error_message = f"No workspace option at index {selected}."
+            info_message = "Choose a listed number or enter a directory path."
+            continue
 
         try:
-            return _validate_workspace_directory(
+            selected_path = _validate_workspace_directory(
                 _resolve_workspace_path(selected, current_dir)
             )
         except ValueError as exc:
-            selector_tui.show_notice(str(exc), level="error")
-            selector_tui.show_notice(
-                "Choose another directory or pick Custom path...",
-                level="info",
+            error_message = str(exc)
+            info_message = "Choose a listed number or enter a valid directory path."
+            continue
+
+        validation_error = _validate_startup_workspace_choice(selected_path)
+        if validation_error:
+            error_message = validation_error
+            info_message = (
+                "Fix that workspace configuration or choose another directory."
             )
+            continue
+
+        selector_tui.clear_screen()
+        return selected_path.resolve()
 
 
 @click.command()
@@ -951,6 +1032,7 @@ def main(
             requested_cwd=cwd,
             workspace_history=workspace_history,
         )
+        _load_env_file(requested_cwd / ".env")
         config = _load_validated_config(requested_cwd)
     except Exception as e:
         console.print(f"[error]Configuration Error: {e}[/error]")

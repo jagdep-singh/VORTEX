@@ -12,11 +12,11 @@ for arg in "$@"; do
 done
 
 if [ "$#" -eq 0 ]; then
-    exec python /app/main.py --cwd "$DEFAULT_CWD"
+    exec vortex --cwd "$DEFAULT_CWD"
 fi
 
 if [ "$has_cwd_flag" -eq 1 ]; then
-    exec python /app/main.py "$@"
+    exec vortex "$@"
 fi
 
-exec python /app/main.py --cwd "$DEFAULT_CWD" "$@"
+exec vortex --cwd "$DEFAULT_CWD" "$@"

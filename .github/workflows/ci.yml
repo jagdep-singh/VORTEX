@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install tooling
+        run: python -m pip install --upgrade pip build
+
+      - name: Install project
+        run: python -m pip install --no-build-isolation .
+
+      - name: Run tests
+        run: python -m unittest tests/test_model_discovery.py
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Smoke test installed CLI
+        run: vortex --help

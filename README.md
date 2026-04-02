@@ -19,11 +19,11 @@ It is designed to run against a working directory on your machine, stream model 
 
 ## How It Runs
 
-The entrypoint is [main.py](./main.py).
+The packaged CLI command is `vortex`. For development, the entrypoint remains [main.py](./main.py).
 
 By default:
 
-- the app starts in interactive mode if you run `python3 main.py`
+- the app starts in interactive mode if you run `vortex`
 - if you do not pass `--cwd`, VORTEX shows a workspace picker before the session starts
 - the picker includes a `Custom path...` option for manually entering a project directory
 - the selected working directory is remembered for later sessions
@@ -33,19 +33,19 @@ By default:
 Single prompt mode:
 
 ```bash
-python3 main.py "write a hello world program in c"
+vortex "write a hello world program in c"
 ```
 
 Interactive mode:
 
 ```bash
-python3 main.py
+vortex
 ```
 
 Use a different working directory:
 
 ```bash
-python3 main.py --cwd .
+vortex --cwd .
 ```
 
 Switch projects inside the app:
@@ -61,11 +61,11 @@ Switch projects inside the app:
 
 Config and tool discovery are tied to the active `cwd`.
 
-- If you run `python3 main.py --cwd <path>`, that directory is used directly
-- If you run `python3 main.py` interactively, VORTEX asks you to choose a working directory first
+- If you run `vortex --cwd <path>`, that directory is used directly
+- If you run `vortex` interactively, VORTEX asks you to choose a working directory first
 - Custom paths are validated as existing directories before the session switches to them
 - Recent working directories are remembered and can be reopened with `/cwd <index>` or viewed with `/recent`
-- If you want project-local config from the repo root, run `python3 main.py --cwd .`
+- If you want project-local config from the repo root, run `vortex --cwd .`
 - `.ai-agent/config.toml` is loaded from the active working directory
 - `AGENT.MD` is also loaded from the active working directory
 - `.ai-agent/tools/*.py` is discovered from the active working directory
@@ -79,7 +79,31 @@ Changing `cwd` is treated as a project switch:
 
 ## Requirements
 
-This repo does not currently ship with a packaged installer or lockfile, so setup is still manual.
+VORTEX now ships as a Python package, so you do not need to install each dependency by hand.
+
+The published PyPI distribution name is `vortex-agent-cli`. The installed command stays `vortex`.
+
+Recommended install for a CLI app:
+
+```bash
+pipx install vortex-agent-cli
+```
+
+Local repo install:
+
+```bash
+python3 -m pip install . --no-build-isolation
+```
+
+One-command install from a downloaded zip or checkout:
+
+```bash
+./scripts/install.sh
+```
+
+That script creates `.venv`, installs the package, and gives you a `vortex` executable at `.venv/bin/vortex`.
+
+If you are working from a checkout before the first public release, use `pipx install . --pip-args="--no-build-isolation"` or `./scripts/install.sh`.
 
 Core Python dependencies used by the codebase include:
 
@@ -97,7 +121,29 @@ Optional integrations:
 - `ddgs` for web search
 - `fastmcp` for MCP usage
 
-The bundled `requirements.txt` installs the core runtime used by the app and the Docker image. Optional integrations remain opt-in.
+The bundled `requirements.txt` remains available for compatibility, but `pyproject.toml` is now the primary install source for the app and Docker image.
+
+## Publishing To PyPI
+
+The repo now includes:
+
+- CI packaging validation in [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)
+- a release workflow in [`.github/workflows/publish-pypi.yml`](./.github/workflows/publish-pypi.yml)
+- PyPI-ready metadata in [`pyproject.toml`](./pyproject.toml)
+
+First-time setup:
+
+1. Create the `vortex-agent-cli` project on PyPI.
+2. In PyPI, add a Trusted Publisher for GitHub Actions with owner `jagdep-singh`, repository `VORTEX`, workflow `publish-pypi.yml`, and environment `pypi`.
+3. In GitHub, create an environment named `pypi`. Add required reviewers if you want a manual approval gate before publish.
+
+Release flow:
+
+1. Bump the version in [`pyproject.toml`](./pyproject.toml).
+2. Commit the version change and push it.
+3. Create a GitHub Release for that version tag.
+4. The `publish-pypi` workflow builds the package, runs tests, checks the distributions, and publishes to PyPI.
+5. After the release is live, users can install it with `pipx install vortex-agent-cli`.
 
 ## Environment Variables
 
@@ -117,7 +163,7 @@ This repo now includes:
 - [Dockerfile](./Dockerfile)
 - [.dockerignore](./.dockerignore)
 - [docker/entrypoint.sh](./docker/entrypoint.sh)
-- [requirements.txt](./requirements.txt)
+- [pyproject.toml](./pyproject.toml)
 
 The container is built for interactive terminal usage.
 
@@ -229,9 +275,7 @@ temperature = 0
 max_output_tokens = 8192
 ```
 
-VORTEX also ships with a bundled OpenRouter model catalog in [`.ai-agent/models.txt`](./.ai-agent/models.txt). Those entries show up in `/models`, and you can switch to them with either the exact model ID or its number from the list.
-
-To avoid trial-and-error switching, VORTEX can also probe those catalog models and cache their status locally. This lets the UI show whether a model is currently `working`, blocked by `quota`, missing a key, or otherwise unavailable before you switch to it.
+VORTEX now discovers models directly from each configured provider using that profile's resolved API key and base URL. `/models` only shows the models that provider reports for the key it is actually using.
 
 You can also inline a key directly:
 
@@ -248,15 +292,15 @@ max_output_tokens = 8192
 
 Runtime commands:
 
-- `/models` shows configured profiles and the bundled model catalog
-- `/models refresh` probes the catalog and updates cached working/not-working status
+- `/models` shows configured profiles and the models discovered for each profile
+- `/models refresh` refetches the model list from each configured provider
 - `/model openrouter` switches to a named profile
 - `/model use openrouter` also switches to a named profile
-- `/model 1` switches to the first catalog model
-- typing `1` at the prompt also selects the first catalog model when a catalog is loaded
-- `/model openai/gpt-5.4-mini` switches to that catalog model through the OpenRouter profile
-- `/model force 17` overrides the health guard and still tries that catalog model
-- `/model gpt-5-mini` changes the current model name directly
+- `/model 1` switches to the first discovered model
+- typing `1` at the prompt also selects the first discovered model after `/models`
+- `/model openai/gpt-5.4-mini` changes the current model name directly
+- `/model force 17` is available for compatibility, but model discovery no longer depends on a health guard
+- `/model openrouter/free` changes the current model name directly
 - `/config` shows the active model, base URL, and API key source
 
 If the active profile has no resolved API key, the app will warn you.
@@ -290,7 +334,8 @@ The terminal command set currently includes:
 Useful interaction behavior:
 
 - `Ctrl+C` stops the current run without exiting the app
-- arrow keys work in the input prompt through `prompt_toolkit`
+- arrow keys and in-memory history work when `prompt_toolkit` is active
+- VORTEX falls back to a plain terminal prompt on Python 3.14+ or terminals where `prompt_toolkit` is unreliable
 - VORTEX agent output streams live
 - tool calls are rendered as structured terminal cards
 - the agent refreshes a compact workspace snapshot at the start of each run
@@ -404,7 +449,7 @@ The current UI is a custom Rich interface with:
 - approval prompts
 - status lines for model thinking/progress
 
-The input prompt uses `prompt_toolkit` so cursor movement and history work properly in a real terminal.
+The input prompt prefers `prompt_toolkit` when the terminal and Python version cooperate, and falls back to a plain built-in terminal prompt otherwise so input still works reliably.
 
 ## Project Layout
 
@@ -427,19 +472,19 @@ workspace/               default working directory
 
 ## Current State
 
-This project is already usable for local coding tasks, but it is still a hand-rolled agent app rather than a fully packaged product.
+This project is already usable for local coding tasks, and it now installs like a normal Python CLI, but there is still room to improve the end-user experience further.
 
 A few practical things to know:
 
-- setup is still manual
+- the PyPI release path is automated, but the first Trusted Publisher setup still needs to be done once
 - secrets/config handling is flexible but not yet polished into a full settings flow
 - optional integrations are lazy-loaded and only matter if you use those features
 - the default experience is centered around the local `workspace/` folder
 
 ## Quick Start
 
-1. Install the Python dependencies you need for this repo.
+1. Install VORTEX with `pipx install vortex-agent-cli`, `pipx install . --pip-args="--no-build-isolation"`, or `./scripts/install.sh`.
 2. Set `API_KEY` and optionally `BASE_URL`, or configure a model profile.
-3. Run `python3 main.py`.
+3. Run `vortex`.
 4. Type a request at the `╰─ you ›` prompt.
 5. Use `/help` if you want to inspect commands from inside the app.

@@ -17,9 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
+COPY pyproject.toml /app/pyproject.toml
+COPY README.md /app/README.md
 COPY agent /app/agent
 COPY client /app/client
 COPY config /app/config
@@ -32,7 +31,8 @@ COPY tools /app/tools
 COPY ui /app/ui
 COPY utils /app/utils
 COPY main.py /app/main.py
-COPY README.md /app/README.md
+
+RUN pip install --no-cache-dir --no-build-isolation .
 
 RUN mkdir -p /workspace /data/.config /data/.local/share \
     && chmod +x /app/docker/entrypoint.sh \

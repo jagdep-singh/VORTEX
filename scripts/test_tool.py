@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
+import json
 import os
 import sys
-import json
 from datetime import datetime
+from pathlib import Path
 
 
 def main():
@@ -22,9 +23,10 @@ def main():
         "error": error,
     }
 
-    log_path = os.path.expanduser("/Users/rivaanranawat/Desktop/ai-agent/hook.log")
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    with open(log_path, "a") as f:
+    default_log_path = Path(__file__).resolve().parent.parent / ".ai-agent" / "hook.log"
+    log_path = Path(os.environ.get("AI_AGENT_HOOK_LOG", str(default_log_path))).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
         f.write(f"[HOOK] {json.dumps(log_data)}\n")
 
     sys.exit(0)

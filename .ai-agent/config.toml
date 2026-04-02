@@ -1,25 +1,25 @@
-hooks_enabled = true
+hooks_enabled = false
 
 [model]
 temperature = 0
 
-[[hooks]]
-name='test_before_tool'
-trigger='before_tool'
-command='python3 ./scripts/test_tool.py'
-
-[[hooks]]
-name='test_before_agent'
-trigger='before_agent'
-command='python3 ./scripts/test_tool.py'
-
-[mcp_servers.filesystem]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/rivaanranawat/Desktop/ai-agent", "/tmp"]
-
-[mcp_servers.filesystem2]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem222222222222", "/Users/rivaanranawat/Desktop/ai-agent", "/tmp"]
+# Example hooks:
+#
+# [[hooks]]
+# name = "log_before_tool"
+# trigger = "before_tool"
+# command = "python3 ./scripts/test_tool.py"
+#
+# [[hooks]]
+# name = "log_before_agent"
+# trigger = "before_agent"
+# command = "python3 ./scripts/test_tool.py"
+#
+# Example MCP server:
+#
+# [mcp_servers.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", ".", "/tmp"]
 
 # Example custom model profiles:
 #

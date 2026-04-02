@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class ModelConfig(BaseModel):
-    name: str = "gpt-5-mini"
+    name: str = "openrouter/free"
     temperature: float = Field(default=1, ge=0.0, le=2.0)
     context_window: int = 256_000
     max_output_tokens: int = Field(default=8192, ge=256)
@@ -118,7 +118,6 @@ class Config(BaseModel):
     cwd: Path = Field(default_factory=_workspace)
     active_model_profile: str | None = None
     models: dict[str, ModelProfileConfig] = Field(default_factory=dict)
-    model_catalog: list[str] = Field(default_factory=list)
 
     shell_environment: ShellEnvironmentPolicy = Field(
         default_factory=ShellEnvironmentPolicy
@@ -190,6 +189,50 @@ class Config(BaseModel):
             return None
         return self.models.get(self.active_model_profile)
 
+    def resolve_profile_api_key(self, profile_name: str | None) -> str | None:
+        if profile_name is None:
+            return os.environ.get("API_KEY")
+
+        profile = self.models.get(profile_name)
+        if profile is None:
+            return None
+
+        resolved = profile.resolved_api_key
+        if resolved:
+            return resolved
+        if profile.api_key or profile.api_key_env:
+            return None
+        return os.environ.get("API_KEY")
+
+    def resolve_profile_base_url(self, profile_name: str | None) -> str:
+        if profile_name is None:
+            return os.environ.get("BASE_URL") or "https://api.openai.com/v1"
+
+        profile = self.models.get(profile_name)
+        if profile and profile.base_url:
+            return profile.base_url
+        return os.environ.get("BASE_URL") or "https://api.openai.com/v1"
+
+    def resolve_profile_key_source_label(self, profile_name: str | None) -> str:
+        if profile_name is None:
+            return "env:API_KEY" if os.environ.get("API_KEY") else "missing:API_KEY"
+
+        profile = self.models.get(profile_name)
+        if profile is None:
+            return "missing"
+
+        if profile.api_key:
+            return f"profile:{profile_name}.api_key"
+
+        if profile.api_key_env:
+            if os.environ.get(profile.api_key_env):
+                return f"env:{profile.api_key_env}"
+            return f"missing:{profile.api_key_env}"
+
+        if os.environ.get("API_KEY"):
+            return "env:API_KEY"
+        return "missing:API_KEY"
+
     @property
     def current_model_config(self) -> ModelConfig:
         profile = self.active_profile
@@ -199,21 +242,11 @@ class Config(BaseModel):
 
     @property
     def api_key(self) -> str | None:
-        profile = self.active_profile
-        if profile:
-            resolved = profile.resolved_api_key
-            if resolved:
-                return resolved
-            if profile.api_key or profile.api_key_env:
-                return None
-        return os.environ.get("API_KEY")
+        return self.resolve_profile_api_key(self.active_model_profile)
 
     @property
     def base_url(self) -> str | None:
-        profile = self.active_profile
-        if profile and profile.base_url:
-            return profile.base_url
-        return os.environ.get("BASE_URL") or "https://api.openai.com/v1"
+        return self.resolve_profile_base_url(self.active_model_profile)
 
     @property
     def model_name(self) -> str:
@@ -241,17 +274,7 @@ class Config(BaseModel):
 
     @property
     def api_key_source_label(self) -> str:
-        profile = self.active_profile
-        if profile:
-            if profile.api_key:
-                return f"profile:{self.active_model_profile}.api_key"
-            if profile.api_key_env and os.environ.get(profile.api_key_env):
-                return f"env:{profile.api_key_env}"
-            if profile.api_key_env:
-                return f"missing:{profile.api_key_env}"
-        if os.environ.get("API_KEY"):
-            return "env:API_KEY"
-        return "missing"
+        return self.resolve_profile_key_source_label(self.active_model_profile)
 
     @property
     def active_model_label(self) -> str:
@@ -266,17 +289,6 @@ class Config(BaseModel):
 
     def list_model_profiles(self) -> list[tuple[str, ModelProfileConfig]]:
         return list(self.models.items())
-
-    def list_catalog_models(self) -> list[str]:
-        seen: set[str] = set()
-        catalog: list[str] = []
-        for model_name in self.model_catalog:
-            candidate = model_name.strip()
-            if not candidate or candidate in seen:
-                continue
-            seen.add(candidate)
-            catalog.append(candidate)
-        return catalog
 
     def validate(self) -> list[str]:
         errors: list[str] = []

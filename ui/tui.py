@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from rich.align import Align
 from rich import box
 from rich.columns import Columns
 from rich.console import Console, Group
@@ -20,7 +22,7 @@ from rich.theme import Theme
 
 from config.config import Config
 from tools.base import ToolConfirmation
-from utils.model_health import ModelHealthRecord
+from utils.model_discovery import ModelCatalogResult, flatten_model_catalog
 from utils.paths import display_path_rel_to_cwd
 from utils.text import truncate_text
 
@@ -130,8 +132,19 @@ class TUI:
         self._supports_live_status = sys.stdout.isatty()
         self._status_suspended = False
         self._prompt_session = None
+        requested_prompt_toolkit = os.environ.get("VORTEX_USE_PROMPT_TOOLKIT", "")
+        self._use_prompt_toolkit = requested_prompt_toolkit.lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not requested_prompt_toolkit:
+            self._use_prompt_toolkit = sys.version_info < (3, 14)
 
         if (
+            self._use_prompt_toolkit
+            and
             PromptSession is not None
             and InMemoryHistory is not None
             and sys.stdin.isatty()
@@ -149,6 +162,10 @@ class TUI:
         if self._status_live is not None:
             self._status_live.stop()
             self._status_live = None
+
+    def clear_screen(self) -> None:
+        self._pause_live_status()
+        self.console.clear(home=True)
 
     def _badge(self, label: str, style: str) -> Text:
         return Text(f" {label.upper()} ", style=style)
@@ -175,6 +192,21 @@ class TUI:
             equal=False,
             padding=(0, 1),
         )
+
+    def _action_table(
+        self,
+        rows: Iterable[tuple[str, str]],
+        *,
+        key_style: str = "meta.value",
+    ) -> Table:
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(style=key_style, no_wrap=True)
+        table.add_column(style="muted", overflow="fold")
+
+        for key, value in rows:
+            table.add_row(str(key), str(value))
+
+        return table
 
     def _section_title(self, label: str, badge_style: str, title_style: str) -> Text:
         title = Text()
@@ -234,6 +266,7 @@ class TUI:
         label = status or "unknown"
         style_map = {
             "working": "success",
+            "cached": "warning",
             "unknown": "muted",
             "missing-key": "warning",
             "quota": "warning",
@@ -254,11 +287,56 @@ class TUI:
             return checked_at
         return dt.strftime("%Y-%m-%d %H:%M")
 
+    def _tool_context_summary(self, tool_name: str, args: dict[str, Any]) -> Text | None:
+        parts: list[str] = []
+
+        path_value = args.get("path")
+        if isinstance(path_value, str) and path_value:
+            parts.append(str(display_path_rel_to_cwd(path_value, self.cwd)))
+
+        command_value = args.get("command")
+        if isinstance(command_value, str) and command_value.strip():
+            parts.append(self._short_text(f"$ {command_value.strip()}", limit=96))
+
+        query_value = args.get("query")
+        if isinstance(query_value, str) and query_value.strip():
+            parts.append(f"query: {self._short_text(query_value.strip(), limit=48)}")
+
+        pattern_value = args.get("pattern")
+        if isinstance(pattern_value, str) and pattern_value.strip():
+            parts.append(f"pattern: {self._short_text(pattern_value.strip(), limit=40)}")
+
+        url_value = args.get("url")
+        if isinstance(url_value, str) and url_value.strip():
+            parts.append(self._short_text(url_value.strip(), limit=72))
+
+        action_value = args.get("action")
+        if isinstance(action_value, str) and action_value.strip():
+            parts.append(f"action: {action_value.strip()}")
+
+        if not parts:
+            return None
+
+        return self._summary_text(parts)
+
+    def _tool_subtitle(
+        self,
+        state: str | None = None,
+        *,
+        call_id: str = "",
+        tool_kind: str | None = None,
+    ) -> Text:
+        parts: list[str] = []
+        if state:
+            parts.append(state)
+        if tool_kind:
+            parts.append(tool_kind)
+        if call_id:
+            parts.append(f"#{call_id[:8]}")
+        return Text(" · ".join(parts), style="panel.subtitle")
+
     def prompt(self) -> str:
-        return (
-            f"\n[prompt]{self._PROMPT_MARKER}[/prompt] "
-            "[prompt.hint]you › [/prompt.hint]"
-        )
+        return "you > "
 
     def _prompt_message(self):
         if FormattedText is None:
@@ -299,13 +377,13 @@ class TUI:
     async def read_prompt(self) -> str:
         self._pause_live_status()
 
-        if self._prompt_session is not None:
-            return await self._prompt_session.prompt_async(
-                self._prompt_message(),
-                mouse_support=False,
-            )
-
-        return self.console.input(self.prompt())
+        # Render the main chat prompt through Rich instead of relying on the
+        # terminal's built-in input prompt. This keeps the `you >` prompt
+        # visible in terminals where plain `input(prompt)` can disappear after
+        # the welcome screen or Rich output.
+        return self.console.input(
+            f"\n[prompt]{self._PROMPT_MARKER} [/prompt][prompt.hint]you › [/prompt.hint]"
+        )
 
     async def prompt_workspace_selection(
         self,
@@ -314,6 +392,8 @@ class TUI:
         fallback_dir: Path,
         recent_workspaces: list[dict[str, str]],
         current_label: str,
+        error_message: str | None = None,
+        info_message: str | None = None,
     ) -> str:
         table = Table(expand=True, box=None, padding=(0, 1))
         table.add_column("#", style="meta.label", no_wrap=True)
@@ -349,22 +429,44 @@ class TUI:
         for index, directory, note in options:
             table.add_row(index, directory, note)
 
-        self._pause_live_status()
-        self.console.print()
+        self.clear_screen()
+        messages: list[Any] = [
+            Text("Choose a working directory for this session.", style="muted"),
+            Text(
+                f"Current shell directory: {self._home_relative(current_dir)}",
+                style="meta.value",
+            ),
+        ]
+
+        if error_message:
+            messages.extend([Text(), Text(error_message, style="error")])
+        elif info_message:
+            messages.extend([Text(), Text(info_message, style="warning")])
+
+        messages.extend(
+            [
+                Text(),
+                Text(
+                    "Choose a number or type any directory path on this machine.",
+                    style="muted",
+                ),
+                Text(
+                    "Absolute paths, ~/ paths, and paths relative to the current shell directory are all supported.",
+                    style="muted",
+                ),
+                Text(),
+                table,
+            ]
+        )
+
         self.console.print(
             self._panel(
-                Group(
-                    Text("Choose a working directory for this session.", style="muted"),
-                    Text(
-                        "Choose a number. Pick Custom path... to enter a project directory.",
-                        style="muted",
-                    ),
-                    table,
-                ),
+                Group(*messages),
                 title=Text.assemble(
                     self._badge("CWD", "status.info.badge"),
-                    (" Workspace selection", "panel.title"),
+                    (" Workspace setup", "panel.title"),
                 ),
+                subtitle=Text("startup", style="panel.subtitle"),
             )
         )
 
@@ -378,18 +480,52 @@ class TUI:
             )
 
         return Prompt.ask(
-            "[meta.label]workspace[/meta.label] [prompt.hint]›[/prompt.hint]",
+            "[meta.label]workspace/path[/meta.label] [prompt.hint]›[/prompt.hint]",
             console=self.console,
             default=default_choice,
         )
 
-    async def prompt_custom_workspace_path(self, *, base_dir: Path) -> str:
-        self._pause_live_status()
-        self.console.print()
-        self.console.print(
+    async def prompt_custom_workspace_path(
+        self,
+        *,
+        base_dir: Path,
+        error_message: str | None = None,
+        info_message: str | None = None,
+    ) -> str:
+        self.clear_screen()
+        body: list[Any] = [
+            Text("Enter a project directory to use as the active workspace.", style="muted"),
             Text(
-                f"Enter a project directory path. Relative paths resolve from {self._home_relative(base_dir)}.",
-                style="muted",
+                f"Relative paths resolve from: {self._home_relative(base_dir)}",
+                style="meta.value",
+            ),
+        ]
+
+        if error_message:
+            body.extend([Text(), Text(error_message, style="error")])
+        elif info_message:
+            body.extend([Text(), Text(info_message, style="warning")])
+
+        body.extend(
+            [
+                Text(),
+                Text("Examples:", style="meta.label"),
+                Text("~/projects/my-app", style="meta.value"),
+                Text("/Users/you/src/my-app", style="meta.value"),
+                Text("../shared-workspace", style="meta.value"),
+                Text(),
+                Text("Press Enter with no value to go back.", style="muted"),
+            ]
+        )
+
+        self.console.print(
+            self._panel(
+                Group(*body),
+                title=Text.assemble(
+                    self._badge("Path", "status.info.badge"),
+                    (" Custom workspace", "panel.title"),
+                ),
+                subtitle=Text("startup", style="panel.subtitle"),
             )
         )
 
@@ -410,56 +546,89 @@ class TUI:
         self._pause_live_status()
         workspace = self._home_relative(self.config.cwd)
         rows = [
-            ("model", self.config.model_name),
-            ("workspace", workspace),
-            ("approval", self.config.approval.value),
-            ("turns", f"{self.config.max_turns} max"),
+            ("Model", self.config.model_name),
+            ("Workspace", workspace),
+            ("Approval", self.config.approval.value),
+            ("Turns", f"{self.config.max_turns} max"),
+        ]
+        quick_actions = [
+            ("/help", "Show the full command reference"),
+            ("/scan", "Refresh workspace context"),
+            ("/index", "Rebuild the symbol index"),
+            ("/cwd", "Switch to another project"),
+            ("/models", "Inspect or refresh provider models"),
+            ("/config", "Review the current session settings"),
         ]
 
-        value_width = max(len(value) for _, value in rows)
-        inner_width = max(62, 13 + value_width)
-        top = Text(f"┌─ session {'─' * (inner_width - 12)}┐", style="dim")
-        bottom = Text(f"└{'─' * inner_width}┘", style="dim")
-
-        session_lines: list[Text] = [top]
-        for label, value in rows:
-            line = Text("│  ", style="dim")
-            line.append(f"{label:<9}", style="meta.label")
-            line.append(f" {value:<{inner_width - 13}}", style="meta.value")
-            line.append("│", style="dim")
-            session_lines.append(line)
-        session_lines.append(bottom)
-
         self.console.print()
-        self.console.print(Text(self._LOGO, style="brand"))
+        self.console.print(Align.center(Text(self._LOGO, style="brand")))
         self.console.print(
-            Text(
-                "─── VORTEX AGENT TERMINAL  ·  TOOLS  ·  APPROVALS ───",
-                style="muted",
-            )
-        )
-        self.console.print()
-        for line in session_lines:
-            self.console.print(line)
-        self.console.print()
-        self.console.print(Text("commands", style="muted"))
-        self.console.print(
-            self._command_pills(
-                ["/help", "/scan", "/index", "/cwd", "/recent", "/config", "/models", "/approval", "/model", "/exit"]
+            Rule(
+                Text("VORTEX TERMINAL · LOCAL AGENT · LIVE TOOLS", style="muted"),
+                style="panel.border",
             )
         )
         self.console.print()
         self.console.print(
-            Text("Ctrl+C to stop current run · stay in session", style="muted")
+            Columns(
+                [
+                    self._panel(
+                        Group(
+                            Text(
+                                "Session is ready for workspace-aware coding tasks.",
+                                style="muted",
+                            ),
+                            Text(),
+                            self._kv_table(rows),
+                        ),
+                        title=Text.assemble(
+                            self._badge("Session", "status.info.badge"),
+                            (" Current context", "panel.title"),
+                        ),
+                        subtitle=Text("ready", style="panel.subtitle"),
+                    ),
+                    self._panel(
+                        Group(
+                            Text(
+                                "Start with a prompt or one of the shortcuts below.",
+                                style="muted",
+                            ),
+                            Text(),
+                            self._action_table(quick_actions),
+                        ),
+                        title=Text.assemble(
+                            self._badge("Start", "status.info.badge"),
+                            (" Quick actions", "panel.title"),
+                        ),
+                        subtitle=Text("slash commands", style="panel.subtitle"),
+                    ),
+                ],
+                expand=True,
+                equal=True,
+            )
+        )
+        self.console.print()
+        self.console.print(
+            self._summary_text(
+                [
+                    "Ctrl+C stops the current run and keeps the session open",
+                    "type a message below to begin",
+                ]
+            )
         )
 
     def begin_assistant(self) -> None:
         self._pause_live_status()
-        title = Text()
-        title.append("vortex agent", style="assistant.badge")
-
         self.console.print()
-        self.console.print(Rule(title, style="panel.border"))
+        self.console.print(
+            Rule(
+                Text.assemble(
+                    self._badge("Agent", "assistant.badge"),
+                    (" VORTEX", "assistant.badge"),
+                ),
+                style="panel.border",
+            )
+        )
         self._assistant_stream_open = True
         self._assistant_mode = "text"
         self._assistant_pending_backticks = ""
@@ -651,7 +820,8 @@ class TUI:
         line = Text()
         frame = self._STATUS_FRAMES[self._status_frame_index]
         line.append(f"{frame} ", style="thinking.badge")
-        line.append(f"{self._status_label} › ", style="muted")
+        line.append(f"{self._status_label.upper()} ", style="meta.label")
+        line.append("· ", style="muted")
         line.append(self._status_detail, style="thinking")
         return line
 
@@ -679,10 +849,17 @@ class TUI:
             "warning": "warning",
             "error": "error",
         }.get(level, "info")
+        markers = {
+            "info": "i",
+            "success": "ok",
+            "warning": "!",
+            "error": "x",
+        }
 
         line = Text()
-        line.append_text(self._badge(level, f"status.{level}.badge"))
-        line.append(" ")
+        line.append(f"{markers.get(level, 'i')} ", style=f"status.{level}.badge")
+        line.append(level.upper(), style=text_style)
+        line.append("  ", style="muted")
         line.append(message, style=text_style)
         self.console.print()
         self.console.print(line)
@@ -738,9 +915,6 @@ class TUI:
         title.append_text(self._badge(label, style))
         title.append(" ")
         title.append(name, style="tool")
-        if call_id:
-            title.append("  ")
-            title.append(f"#{call_id[:8]}", style="muted")
         return title
 
     def tool_call_start(
@@ -765,13 +939,20 @@ class TUI:
             if display_args
             else Text("No arguments provided", style="muted")
         )
+        summary = self._tool_context_summary(name, display_args)
+        if summary:
+            body = Group(summary, Text(), body)
 
         self.console.print()
         self.console.print(
             self._panel(
                 body,
                 title=self._tool_title("Tool", name, call_id, "tool.badge"),
-                subtitle=Text("running", style="panel.subtitle"),
+                subtitle=self._tool_subtitle(
+                    "running",
+                    call_id=call_id,
+                    tool_kind=tool_kind,
+                ),
                 border_style=border_style,
             )
         )
@@ -1089,7 +1270,13 @@ class TUI:
             self._panel(
                 Group(*blocks),
                 title=self._tool_title("Tool", name, call_id, "tool.badge"),
-                subtitle=self._badge(state, state_style),
+                subtitle=Text.assemble(
+                    self._badge(state, state_style),
+                    (
+                        f"  {self._tool_subtitle(call_id=call_id, tool_kind=tool_kind).plain}",
+                        "panel.subtitle",
+                    ),
+                ),
                 border_style=border_style,
             )
         )
@@ -1097,9 +1284,15 @@ class TUI:
     def handle_confirmation(self, confirmation: ToolConfirmation) -> bool:
         self.suspend_status()
 
+        summary_parts = [confirmation.description]
+        if confirmation.affected_paths:
+            summary_parts.append(f"{len(confirmation.affected_paths)} path(s)")
+        if confirmation.is_dangerous:
+            summary_parts.append("higher risk")
+
         blocks: list[Any] = [
+            self._summary_text(summary_parts, style="warning"),
             Text(confirmation.tool_name, style="tool"),
-            Text(confirmation.description, style="meta.value"),
         ]
 
         if confirmation.command:
@@ -1123,7 +1316,7 @@ class TUI:
                     self._badge("Approval", "status.warning.badge"),
                     (" Tool confirmation required", "warning"),
                 ),
-                subtitle=Text("y / n", style="panel.subtitle"),
+                subtitle=Text("confirm with y / n", style="panel.subtitle"),
                 border_style="warning",
             )
         )
@@ -1144,29 +1337,36 @@ class TUI:
         self.console.print()
         self.console.print(
             self._panel(
-                self._kv_table(
-                    [
-                        ("Model", self.config.model_name),
-                        (
-                            "Active profile",
-                            self.config.active_model_profile or "default",
-                        ),
-                        ("Base URL", base_url),
-                        ("API key source", self.config.api_key_source_label),
-                        ("Temperature", self.config.temperature),
-                        ("Max output tokens", self.config.max_output_tokens),
-                        ("Approval", self.config.approval.value),
-                        ("Working dir", self.config.cwd),
-                        ("Max turns", self.config.max_turns),
-                        ("Configured profiles", len(self.config.models)),
-                        ("Catalog models", len(self.config.list_catalog_models())),
-                        ("Hooks enabled", self.config.hooks_enabled),
-                    ]
+                Group(
+                    Text(
+                        "Resolved settings for the current workspace and active model profile.",
+                        style="muted",
+                    ),
+                    Text(),
+                    self._kv_table(
+                        [
+                            ("Model", self.config.model_name),
+                            (
+                                "Active profile",
+                                self.config.active_model_profile or "default",
+                            ),
+                            ("Base URL", base_url),
+                            ("API key source", self.config.api_key_source_label),
+                            ("Temperature", self.config.temperature),
+                            ("Max output tokens", self.config.max_output_tokens),
+                            ("Approval", self.config.approval.value),
+                            ("Working dir", self.config.cwd),
+                            ("Max turns", self.config.max_turns),
+                            ("Configured profiles", len(self.config.models)),
+                            ("Hooks enabled", self.config.hooks_enabled),
+                        ]
+                    ),
                 ),
                 title=Text.assemble(
                     self._badge("Config", "status.info.badge"),
                     (" Current settings", "panel.title"),
                 ),
+                subtitle=Text(self.config.active_model_label, style="panel.subtitle"),
             )
         )
 
@@ -1174,7 +1374,7 @@ class TUI:
         self,
         config: Config,
         *,
-        model_health: dict[str, ModelHealthRecord] | None = None,
+        model_catalog: list[ModelCatalogResult] | None = None,
     ) -> None:
         profile_table = Table(expand=True, box=None, padding=(0, 1))
         profile_table.add_column("Name", style="meta.value")
@@ -1188,8 +1388,8 @@ class TUI:
             profile_table.add_row(
                 name,
                 profile.model.name,
-                profile.base_url or "default",
-                profile.key_source_label,
+                config.resolve_profile_base_url(name),
+                config.resolve_profile_key_source_label(name),
                 "yes" if config.active_model_profile == name else "",
             )
 
@@ -1205,46 +1405,65 @@ class TUI:
             )
         )
 
-        catalog_models = config.list_catalog_models()
+        catalog_results = model_catalog or []
+        catalog_models = flatten_model_catalog(catalog_results)
         catalog_table = Table(expand=True, box=None, padding=(0, 1))
         catalog_table.add_column("#", style="meta.label", no_wrap=True)
         catalog_table.add_column("Model ID", style="meta.value")
-        catalog_table.add_column("Route", style="muted", no_wrap=True)
+        catalog_table.add_column("Profile", style="muted", no_wrap=True)
+        catalog_table.add_column("Base URL", style="muted")
         catalog_table.add_column("Status", no_wrap=True)
         catalog_table.add_column("Checked", style="muted", no_wrap=True)
         catalog_table.add_column("Note", style="muted")
         catalog_table.add_column("Active", style="meta.value", no_wrap=True)
 
-        for index, model_name in enumerate(catalog_models, start=1):
-            record = (model_health or {}).get(model_name)
+        for entry in catalog_models:
             catalog_table.add_row(
-                str(index),
-                model_name,
-                "openrouter",
-                self._model_status_text(record.status if record else "unknown"),
-                self._format_checked_at(record.checked_at if record else None),
-                self._short_text(record.detail if record else ""),
+                str(entry.index),
+                entry.model_name,
+                entry.display_name,
+                entry.base_url,
+                self._model_status_text(entry.status),
+                self._format_checked_at(entry.checked_at),
+                self._short_text(entry.note),
                 (
                     "yes"
-                    if config.active_model_profile == "openrouter"
-                    and config.model_name == model_name
+                    if config.active_model_profile == entry.profile_name
+                    and config.model_name == entry.model_name
                     else ""
                 ),
             )
 
+        for result in catalog_results:
+            if result.models:
+                continue
+
+            lowered_error = (result.error or "").lower()
+            status = "missing-key" if "no api key" in lowered_error else "error"
+            catalog_table.add_row(
+                "-",
+                "-",
+                result.source.display_name,
+                result.source.base_url,
+                self._model_status_text(status),
+                self._format_checked_at(result.checked_at),
+                self._short_text(result.error),
+                "",
+            )
+
         catalog_section = (
             catalog_table
-            if catalog_models
-            else Text("No model catalog entries are available.", style="muted")
+            if catalog_models or catalog_results
+            else Text("No provider-backed model listings are available.", style="muted")
         )
 
         body = Group(
             Text("Profiles", style="meta.label"),
             profile_section,
             Text(),
-            Text("Catalog", style="meta.label"),
+            Text("Discovered models", style="meta.label"),
             Text(
-                "Use /models refresh to probe the catalog, then /model <number> or /model <model-id> to switch.",
+                "Use /models refresh to refetch each provider's model list, then /model <number> to switch.",
                 style="muted",
             ),
             catalog_section,
@@ -1257,12 +1476,12 @@ class TUI:
                 title=Text.assemble(
                     self._badge("Models", "status.info.badge"),
                     (
-                        f" Profiles {len(profiles)} · Catalog {len(catalog_models)}",
+                        f" Profiles {len(profiles)} · Models {len(catalog_models)}",
                         "panel.title",
                     ),
                 ),
                 subtitle=Text(
-                    f"active: {config.active_model_profile or 'default'}",
+                    f"active: {config.active_model_label}",
                     style="panel.subtitle",
                 ),
             )
@@ -1289,6 +1508,7 @@ class TUI:
                     self._badge("Scan", "status.info.badge"),
                     (" Workspace snapshot", "panel.title"),
                 ),
+                subtitle=Text(self._home_relative(self.config.cwd), style="panel.subtitle"),
             )
         )
 
@@ -1313,6 +1533,7 @@ class TUI:
                     self._badge("Index", "status.info.badge"),
                     (" Codebase index", "panel.title"),
                 ),
+                subtitle=Text(self._home_relative(self.config.cwd), style="panel.subtitle"),
             )
         )
 
@@ -1342,6 +1563,7 @@ class TUI:
                     self._badge("Recent", "status.info.badge"),
                     (" Recent workspaces", "panel.title"),
                 ),
+                subtitle=Text(f"{len(entries)} remembered", style="panel.subtitle"),
             )
         )
 
@@ -1354,6 +1576,7 @@ class TUI:
                     self._badge("Stats", "status.info.badge"),
                     (" Session statistics", "panel.title"),
                 ),
+                subtitle=Text(self.config.active_model_label, style="panel.subtitle"),
             )
         )
 
@@ -1370,6 +1593,7 @@ class TUI:
                     self._badge("Tools", "tool.badge"),
                     (f" Available tools ({len(tools)})", "panel.title"),
                 ),
+                subtitle=Text(self._home_relative(self.config.cwd), style="panel.subtitle"),
             )
         )
 
@@ -1396,6 +1620,7 @@ class TUI:
                     self._badge("MCP", "status.info.badge"),
                     (f" Servers ({len(servers)})", "panel.title"),
                 ),
+                subtitle=Text("model context protocol", style="panel.subtitle"),
             )
         )
 
@@ -1420,6 +1645,7 @@ class TUI:
                     self._badge("Sessions", "status.info.badge"),
                     (f" {title_text}", "panel.title"),
                 ),
+                subtitle=Text(f"{len(sessions)} item(s)", style="panel.subtitle"),
             )
         )
 
@@ -1435,9 +1661,9 @@ class TUI:
         commands.add_row(Text("/cwd [path|index]"), "Switch to another project directory")
         commands.add_row(Text("/recent"), "Show remembered workspaces")
         commands.add_row(Text("/config"), "Show current configuration")
-        commands.add_row(Text("/models [refresh]"), "List model profiles or probe the bundled catalog")
-        commands.add_row(Text("/model <name|number>"), "Switch profile, pick a checked catalog model, or change the model name")
-        commands.add_row(Text("/model force <name|number>"), "Override the health guard for a catalog model")
+        commands.add_row(Text("/models [refresh]"), "List model profiles and discover models for each configured API key")
+        commands.add_row(Text("/model <name|number>"), "Switch profile, pick a discovered model, or change the model name")
+        commands.add_row(Text("/model force <name|number>"), "Change the model name directly even if it is not in the discovered list")
         commands.add_row(Text("/approval <mode>"), "Change approval mode")
         commands.add_row(Text("/stats"), "Show session statistics")
         commands.add_row(Text("/tools"), "List available tools")
@@ -1461,6 +1687,7 @@ class TUI:
                 ),
             ),
             title=Text("Workflow", style="panel.title"),
+            subtitle=Text("recommended flow", style="panel.subtitle"),
         )
 
         self.console.print()

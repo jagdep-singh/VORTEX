@@ -1,21 +1,29 @@
 {
     "cSpell.words": [
         "backticked",
+        "CDPATH",
         "ddgs",
         "DFDC",
         "dotenv",
         "fastmcp",
+        "jagdep",
         "modelcontextprotocol",
         "monokai",
         "nasm",
         "nemotron",
         "openrouter",
+        "pipx",
         "platformdirs",
         "pydantic",
+        "pypi",
+        "pyproject",
+        "refetches",
         "restire",
         "rivaanranawat",
+        "setuptools",
         "syscall",
         "tomli",
-        "tomllib"
+        "tomllib",
+        "venv"
     ]
 }
