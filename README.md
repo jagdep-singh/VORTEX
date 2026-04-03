@@ -41,10 +41,23 @@ max_output_tokens = 8192
 
 First run will prompt for provider URL and API key and store them in your workspace `.env`. Use `/config` anytime to see the resolved profile, base URL, key source, and model.
 
+Gemini via Google’s OpenAI-compatible endpoint:
+```toml
+[models.gemini]
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key_env = "GEMINI_API_KEY"
+
+[models.gemini.model]
+name = "gemini-2.0-flash"
+temperature = 0.2
+max_output_tokens = 8192
+```
+
 ## Core commands
 - `/models [refresh]` – list or probe models for all profiles.
 - `/model <name|number>` – switch profile or pick a discovered model.
 - `/config` – show resolved settings.
+- `/api-change` – re-enter provider URL and API key (restarts the session).
 - `/scan` and `/index` – refresh workspace snapshot and symbol index.
 - `/save`, `/sessions`, `/resume`, `/checkpoint`, `/restore` – persistence.
 - `/tools`, `/mcp` – inspect tools and MCP servers.
@@ -64,6 +77,10 @@ Add `--cwd /workspace/subdir` if you want a different project inside the contain
 - Version is in `pyproject.toml`.
 - CI builds/tests/publishes via `.github/workflows/publish-pypi.yml`.
 - Create a GitHub release after bumping the version to publish to PyPI.
+- Current version: 0.1.1.
+
+## Progress log (local)
+- Working notes for handoff live in `progress_report.txt` (ignored by git).
 
 ## Shape of the repo
 - `main.py` – CLI entry.

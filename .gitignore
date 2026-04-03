@@ -4,6 +4,7 @@ __pycache__
 .env
 .env.*
 !.env.example
+progress_report.txt
 workspace/
 build/
 dist/

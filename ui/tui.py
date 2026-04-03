@@ -130,38 +130,6 @@ class TUI:
             "                                          /_/          ",
         ]
     )
-    _ASSISTANT_AURORA = (
-        "#102636",
-        "#153244",
-        "#1a3e52",
-        "#1f4a60",
-        "#25566d",
-        "#2c627b",
-    )
-    _ASSISTANT_INLINE_AURORA = (
-        "#1e3944",
-        "#244552",
-        "#2b5260",
-        "#325f70",
-    )
-    _ASSISTANT_CODE_AURORA = (
-        "#11181f",
-        "#152029",
-        "#192733",
-        "#1d2f3c",
-    )
-    _AURORA_BAR = (
-        "#0c1b2a",
-        "#12263a",
-        "#1b3148",
-        "#234156",
-        "#2c5467",
-        "#376779",
-        "#2c5467",
-        "#234156",
-        "#1b3148",
-        "#12263a",
-    )
     _LOGO = "\n".join(
         [
             "                                                   ",
@@ -310,23 +278,6 @@ class TUI:
                 style="panel.border",
             )
         )
-
-    def _aurora_bar(self, label: str | None = None) -> Text:
-        width = max(self.console.width - 2, 40)
-        bar_text = Text()
-        palette = self._AURORA_BAR
-        label = label or ""
-        label_start = (width - len(label)) // 2 if label else -1
-
-        for i in range(width):
-            color = palette[i % len(palette)]
-            if label and label_start <= i < label_start + len(label):
-                char = label[i - label_start]
-                bar_text.append(char, style=Style(color="#e7fbff", bgcolor=color, bold=True))
-            else:
-                bar_text.append("▄", style=Style(color=color))
-
-        return bar_text
 
     def _kv_table(
         self,
@@ -562,7 +513,7 @@ class TUI:
 
         self.clear_screen()
         self._print_startup_art(self._WORKSPACE_ART, "workspace setup")
-        self.console.print(self._aurora_bar("choose your canvas"))
+        self.console.print(Rule(style="panel.border"))
         messages: list[Any] = [
             Text("Choose a working directory for this session.", style="muted"),
             Text(
@@ -627,7 +578,7 @@ class TUI:
     ) -> str:
         self.clear_screen()
         self._print_startup_art(self._WORKSPACE_ART, "custom workspace")
-        self.console.print(self._aurora_bar("enter a path"))
+        self.console.print(Rule(style="panel.border"))
         body: list[Any] = [
             Text("Enter a project directory to use as the active workspace.", style="muted"),
             Text(
@@ -689,7 +640,7 @@ class TUI:
     ) -> str:
         self.clear_screen()
         self._print_startup_art(self._API_ART, "provider setup")
-        self.console.print(self._aurora_bar("connect your api"))
+        self.console.print(Rule(style="panel.border"))
         body: list[Any] = [
             Text(
                 "VORTEX needs an OpenAI-compatible provider URL before it can start.",
@@ -721,6 +672,7 @@ class TUI:
                 Text("https://api.openai.com/v1", style="meta.value"),
                 Text("https://openrouter.ai/api/v1", style="meta.value"),
                 Text("http://localhost:11434/v1", style="meta.value"),
+                Text("https://generativelanguage.googleapis.com/v1beta/openai", style="meta.value"),
             ]
         )
 
@@ -771,7 +723,7 @@ class TUI:
     ) -> str:
         self.clear_screen()
         self._print_startup_art(self._API_ART, "api key setup")
-        self.console.print(self._aurora_bar("secure access"))
+        self.console.print(Rule(style="panel.border"))
         body: list[Any] = [
             Text(
                 "Enter the API key for the provider you want this workspace to use.",
@@ -870,7 +822,6 @@ class TUI:
                 style="panel.border",
             )
         )
-        self.console.print(self._aurora_bar("the terminal is your studio"))
         self.console.print()
         self.console.print(
             Columns(
@@ -952,17 +903,6 @@ class TUI:
             return "assistant.code_block"
         return "assistant"
 
-    def _assistant_background_color(self, mode: str, line_index: int, column: int) -> str:
-        if mode == "inline_code":
-            palette = self._ASSISTANT_INLINE_AURORA
-        elif mode == "fenced_code":
-            palette = self._ASSISTANT_CODE_AURORA
-        else:
-            palette = self._ASSISTANT_AURORA
-
-        band = ((column // 6) + line_index + self._assistant_animation_phase) % len(palette)
-        return palette[band]
-
     def _render_assistant_text(self, content: str) -> Text:
         rendered = Text()
         mode = "text"
@@ -988,8 +928,7 @@ class TUI:
                 column = 0
                 return
 
-            background = self._assistant_background_color(mode, line_index, column)
-            rendered.append(char, style=base_styles[mode] + Style(bgcolor=background))
+            rendered.append(char, style=base_styles[mode])
             column += 1
 
         i = 0
@@ -1049,7 +988,7 @@ class TUI:
         if not body.plain:
             body = Text(
                 "Thinking through the reply...",
-                style=Style(color="#d6f5ff", bgcolor=self._ASSISTANT_AURORA[0]),
+                style="assistant",
             )
 
         title = Text.assemble(
@@ -1070,7 +1009,7 @@ class TUI:
             border_style="assistant.panel.border",
             box=box.ROUNDED,
             padding=(1, 2),
-            style=Style(bgcolor="#0b131b"),
+            style=Style(bgcolor="#0f1115"),
         )
 
     def stream_assistant_delta(self, content: str) -> None:
@@ -1078,10 +1017,6 @@ class TUI:
             return
 
         self._assistant_buffer += content
-        self._assistant_animation_phase = (
-            self._assistant_animation_phase + 1
-        ) % len(self._ASSISTANT_AURORA)
-
         if self._assistant_live is not None:
             self._assistant_live.update(
                 self._render_assistant_panel(streaming=True),
@@ -2056,6 +1991,7 @@ class TUI:
         commands.add_row(Text("/cwd [path|index]"), "Switch to another project directory")
         commands.add_row(Text("/recent"), "Show remembered workspaces")
         commands.add_row(Text("/config"), "Show current configuration")
+        commands.add_row(Text("/api-change"), "Re-enter provider URL and API key (restarts session)")
         commands.add_row(Text("/models [refresh]"), "List model profiles and discover models for each configured API key")
         commands.add_row(Text("/model <name|number>"), "Switch profile, pick a discovered model, or change the model name")
         commands.add_row(Text("/model force <name|number>"), "Change the model name directly even if it is not in the discovered list")

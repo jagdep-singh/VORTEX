@@ -32,7 +32,7 @@ BLOCKED_COMMANDS = {
 class ShellParams(BaseModel):
     command: str = Field(..., description="The shell command to execute")
     timeout: int = Field(
-        120, ge=1, le=600, description="Timeout in seconds (default: 120)"
+        300, ge=1, le=3600, description="Timeout in seconds (default: 300)"
     )
     cwd: str | None = Field(None, description="Working directory for the command")
 

@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import sys
+import time
 
 import click
 from dotenv import dotenv_values, load_dotenv
@@ -50,6 +51,26 @@ from utils.versioning import (
     recommended_update_instruction,
 )
 from utils.workspace_history import WorkspaceHistoryManager
+
+
+def _clean_error_message(error: object) -> str:
+    if isinstance(error, list):
+        cleaned = [_clean_error_message(item) for item in error]
+        return "; ".join(part for part in cleaned if part)
+
+    if isinstance(error, dict):
+        err = error.get("error") if isinstance(error, dict) and "error" in error else error
+        if isinstance(err, dict):
+            parts: list[str] = []
+            for key in ("code", "status", "message"):
+                value = err.get(key)
+                if value:
+                    parts.append(str(value))
+            if parts:
+                return " ".join(parts)
+        return str(err)
+
+    return str(error).strip()
 
 
 def _load_env_file(path: Path | None, *, override: bool = False) -> None:
@@ -104,6 +125,9 @@ class CLI:
         self._model_health_store = ModelHealthStore()
         self._model_catalog_results: list[ModelCatalogResult] | None = None
         self._model_catalog_signature: tuple[tuple[str, str, str, str], ...] | None = None
+        self._tool_progress_task: asyncio.Task | None = None
+        self._current_tool_label: str | None = None
+        self._current_tool_started_at: float | None = None
 
     async def _reset_model_client(self) -> None:
         if self.agent and self.agent.session and self.agent.session.client:
@@ -182,6 +206,39 @@ class CLI:
             self.tui.show_notice(auto_model_notice[0], level=auto_model_notice[1])
         self.tui.show_workspace_snapshot(new_session.workspace_snapshot)
         self.tui.show_code_index(new_session.code_index_summary)
+
+    async def _restart_session_with_config(self, new_config: Config, *, reason: str) -> None:
+        previous_config = self.config
+        new_session: Session | None = None
+        try:
+            new_session = Session(config=new_config)
+            new_session.approval_manager.confirmation_callback = self.tui.handle_confirmation
+            await new_session.initialize()
+
+            old_session = self.agent.session if self.agent else None
+            if self.agent:
+                self.agent.config = new_config
+                self.agent.session = new_session
+            self.config = new_config
+            self.tui.set_config(new_config)
+            self._invalidate_model_catalog()
+
+            if old_session:
+                with contextlib.suppress(Exception):
+                    await old_session.client.close()
+                with contextlib.suppress(Exception):
+                    await old_session.mcp_manager.shutdown()
+
+            self.tui.show_notice(
+                f"Started a fresh session after {reason.lower()}.",
+                level="success",
+            )
+            self.tui.show_workspace_snapshot(new_session.workspace_snapshot)
+            self.tui.show_code_index(new_session.code_index_summary)
+        except Exception:
+            self.config = previous_config
+            self.tui.set_config(previous_config)
+            raise
 
     async def _prompt_custom_workspace(self, *, base_dir: Path) -> Path | None:
         while True:
@@ -265,6 +322,39 @@ class CLI:
     def _invalidate_model_catalog(self) -> None:
         self._model_catalog_results = None
         self._model_catalog_signature = None
+
+    async def _restart_session_with_config(self, new_config: Config, *, reason: str) -> None:
+        previous_config = self.config
+        new_session: Session | None = None
+        try:
+            new_session = Session(config=new_config)
+            new_session.approval_manager.confirmation_callback = self.tui.handle_confirmation
+            await new_session.initialize()
+
+            old_session = self.agent.session if self.agent else None
+            if self.agent:
+                self.agent.config = new_config
+                self.agent.session = new_session
+            self.config = new_config
+            self.tui.set_config(new_config)
+            self._invalidate_model_catalog()
+
+            if old_session:
+                with contextlib.suppress(Exception):
+                    await old_session.client.close()
+                with contextlib.suppress(Exception):
+                    await old_session.mcp_manager.shutdown()
+
+            self.tui.show_notice(
+                f"Started a fresh session after {reason.lower()}.",
+                level="success",
+            )
+            self.tui.show_workspace_snapshot(new_session.workspace_snapshot)
+            self.tui.show_code_index(new_session.code_index_summary)
+        except Exception:
+            self.config = previous_config
+            self.tui.set_config(previous_config)
+            raise
 
     def _current_catalog_signature(self) -> tuple[tuple[str, str, str, str], ...]:
         signature: list[tuple[str, str, str, str]] = []
@@ -729,7 +819,7 @@ class CLI:
                 elif event.type == AgentEventType.TEXT_DELTA:
                     content = event.data.get("content", "")
                     if not assistant_streaming:
-                        self.tui.clear_status()
+                        self.tui.show_status("Streaming reply…")
                         self.tui.begin_assistant()
                         assistant_streaming = True
                     self.tui.stream_assistant_delta(content)
@@ -740,12 +830,25 @@ class CLI:
                         assistant_streaming = False
                     self.tui.clear_status()
                 elif event.type == AgentEventType.AGENT_ERROR:
-                    error = event.data.get("error", "Unknown error")
+                    error = _clean_error_message(event.data.get("error", "Unknown error"))
                     self.tui.clear_status()
                     self.tui.show_notice(f"Error: {error}", level="error")
+                    lower_error = str(error).lower()
+                    if "invalid argument" in lower_error or "code: 400" in lower_error:
+                        self.tui.show_notice(
+                            "The model rejected the request (invalid argument). Try /models refresh or /api-change, then rerun the task.",
+                            level="warning",
+                        )
                 elif event.type == AgentEventType.TOOL_CALL_START:
                     tool_name = event.data.get("name", "unknown")
                     tool_kind = self._get_tool_kind(tool_name)
+                    args = event.data.get("arguments", {}) or {}
+                    cmd_preview = ""
+                    if tool_name == "shell":
+                        cmd_text = str(args.get("command", "")).strip()
+                        if cmd_text:
+                            cmd_preview = f": {cmd_text[:80]}"
+                    self._start_tool_progress(f"{tool_name}{cmd_preview}")
                     self.tui.tool_call_start(
                         event.data.get("call_id", ""),
                         tool_name,
@@ -755,6 +858,7 @@ class CLI:
                 elif event.type == AgentEventType.TOOL_CALL_COMPLETE:
                     tool_name = event.data.get("name", "unknown")
                     tool_kind = self._get_tool_kind(tool_name)
+                    self._stop_tool_progress()
                     self.tui.tool_call_complete(
                         event.data.get("call_id", ""),
                         tool_name,
@@ -992,6 +1096,18 @@ class CLI:
                     f"Current approval policy: {self.config.approval.value}",
                     level="info",
                 )
+        elif cmd_name_lower == "/api-change":
+            self.tui.show_notice(
+                "API change will prompt for a provider URL and key, then restart the session.",
+                level="warning",
+            )
+            updated_config = await _prompt_for_missing_api_credentials(
+                requested_cwd=self.config.cwd,
+                config=self.config,
+                tui=self.tui,
+                force_prompt_base_url=True,
+            )
+            await self._restart_session_with_config(updated_config, reason="API change")
         elif cmd_name_lower == "/stats":
             stats = self.agent.session.get_stats()
             self.tui.show_stats(stats)
@@ -1132,6 +1248,33 @@ class CLI:
 
         return True
 
+    def _start_tool_progress(self, label: str) -> None:
+        self._current_tool_label = label
+        self._current_tool_started_at = time.monotonic()
+        if self._tool_progress_task is None or self._tool_progress_task.done():
+            self._tool_progress_task = asyncio.create_task(self._animate_tool_progress())
+
+    def _stop_tool_progress(self) -> None:
+        self._current_tool_label = None
+        self._current_tool_started_at = None
+        if self._tool_progress_task is not None:
+            self._tool_progress_task.cancel()
+            self._tool_progress_task = None
+        self.tui.clear_status()
+
+    async def _animate_tool_progress(self) -> None:
+        try:
+            while self._current_tool_label:
+                elapsed = 0
+                if self._current_tool_started_at is not None:
+                    elapsed = int(time.monotonic() - self._current_tool_started_at)
+                self.tui.show_status(
+                    f"Running {self._current_tool_label} • {elapsed}s elapsed"
+                )
+                await asyncio.sleep(0.6)
+        except asyncio.CancelledError:
+            return
+
     async def _switch_to_catalog_entry(self, entry: ModelCatalogEntry) -> None:
         self.config.active_model_profile = entry.profile_name
         self.config.model_name = entry.model_name
@@ -1209,6 +1352,7 @@ async def _prompt_for_missing_api_credentials(
     config: Config,
     tui: TUI,
     initial_api_key_error: str | None = None,
+    force_prompt_base_url: bool = False,
 ) -> Config:
     env_path = requested_cwd / ".env"
     api_key_env_name = resolve_api_key_env_name(config)
@@ -1218,7 +1362,7 @@ async def _prompt_for_missing_api_credentials(
     docs_path = PROJECT_ROOT / "docs" / "api-keys.md"
     if not docs_path.is_file():
         docs_path = None
-    prompt_for_base_url = should_prompt_for_base_url(config)
+    prompt_for_base_url = force_prompt_base_url or should_prompt_for_base_url(config)
 
     while True:
         if prompt_for_base_url:
