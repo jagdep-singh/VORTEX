@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -11,6 +11,21 @@ from openai import APIConnectionError, APIError, AsyncOpenAI, RateLimitError
 
 from config.config import Config
 from config.loader import get_data_dir
+from utils.model_health import ModelHealthRecord
+
+
+MODEL_STATUS_ORDER = (
+    "working",
+    "quota",
+    "rate-limited",
+    "auth-error",
+    "unavailable",
+    "offline",
+    "error",
+    "missing-key",
+    "cached",
+    "unknown",
+)
 
 
 @dataclass(frozen=True)
@@ -146,11 +161,18 @@ def build_model_catalog_sources(config: Config) -> list[ModelCatalogSource]:
     return sources
 
 
-def flatten_model_catalog(results: list[ModelCatalogResult]) -> list[ModelCatalogEntry]:
+def flatten_model_catalog(
+    results: list[ModelCatalogResult],
+    health_records: dict[tuple[str, str], ModelHealthRecord] | None = None,
+) -> list[ModelCatalogEntry]:
     entries: list[ModelCatalogEntry] = []
 
     for result in results:
         for model_name in result.models:
+            record = None
+            if health_records is not None:
+                record = health_records.get((result.source.display_name, model_name))
+
             entries.append(
                 ModelCatalogEntry(
                     index=len(entries) + 1,
@@ -159,14 +181,105 @@ def flatten_model_catalog(results: list[ModelCatalogResult]) -> list[ModelCatalo
                     model_name=model_name,
                     base_url=result.source.base_url,
                     key_source_label=result.source.key_source_label,
-                    checked_at=result.checked_at,
+                    checked_at=record.checked_at if record else result.checked_at,
                     is_active=result.source.is_active,
-                    status="cached" if result.cached else "working",
+                    status=(
+                        record.status
+                        if record
+                        else "cached"
+                        if result.cached
+                        else "unknown"
+                    ),
                     note=result.error if result.cached else None,
                 )
             )
 
     return entries
+
+
+def select_best_working_model(
+    results: list[ModelCatalogResult],
+    *,
+    health_records: dict[tuple[str, str], ModelHealthRecord] | None = None,
+    preferred_profile_name: str | None = None,
+    preferred_model_name: str | None = None,
+) -> ModelCatalogEntry | None:
+    working_entries = [
+        entry
+        for entry in flatten_model_catalog(results, health_records=health_records)
+        if entry.status == "working"
+    ]
+    if not working_entries:
+        return None
+
+    def _rank(entry: ModelCatalogEntry) -> tuple[int, int, int, int, int]:
+        is_exact_match = (
+            entry.profile_name == preferred_profile_name
+            and entry.model_name == preferred_model_name
+        )
+        is_same_profile = entry.profile_name == preferred_profile_name
+        is_same_model_name = entry.model_name == preferred_model_name
+        return (
+            1 if is_exact_match else 0,
+            1 if is_same_profile else 0,
+            1 if is_same_model_name else 0,
+            1 if entry.is_active else 0,
+            -entry.index,
+        )
+
+    return max(working_entries, key=_rank)
+
+
+def model_status_rank(status: str | None) -> int:
+    normalized = (status or "unknown").strip().lower()
+    try:
+        return MODEL_STATUS_ORDER.index(normalized)
+    except ValueError:
+        return len(MODEL_STATUS_ORDER)
+
+
+def order_model_catalog_entries(
+    entries: list[ModelCatalogEntry],
+    *,
+    active_profile_name: str | None = None,
+    active_model_name: str | None = None,
+) -> list[ModelCatalogEntry]:
+    def _sort_key(entry: ModelCatalogEntry) -> tuple[int, int, int, int, int, str, str]:
+        is_exact_active = (
+            entry.profile_name == active_profile_name
+            and entry.model_name == active_model_name
+        )
+        is_same_profile = entry.profile_name == active_profile_name
+        is_same_model_name = entry.model_name == active_model_name
+        return (
+            model_status_rank(entry.status),
+            0 if is_exact_active else 1,
+            0 if is_same_profile else 1,
+            0 if is_same_model_name else 1,
+            0 if entry.is_active else 1,
+            entry.display_name.lower(),
+            entry.model_name.lower(),
+        )
+
+    ordered = sorted(entries, key=_sort_key)
+    return [replace(entry, index=index) for index, entry in enumerate(ordered, start=1)]
+
+
+def group_model_catalog_entries(
+    entries: list[ModelCatalogEntry],
+) -> list[tuple[str, list[ModelCatalogEntry]]]:
+    grouped: dict[str, list[ModelCatalogEntry]] = {}
+    for entry in entries:
+        grouped.setdefault(entry.status or "unknown", []).append(entry)
+
+    ordered_statuses = [
+        status for status in MODEL_STATUS_ORDER if status in grouped
+    ]
+    ordered_statuses.extend(
+        sorted(status for status in grouped if status not in MODEL_STATUS_ORDER)
+    )
+
+    return [(status, grouped[status]) for status in ordered_statuses]
 
 
 def _dedupe_model_ids(model_ids: list[str]) -> list[str]:

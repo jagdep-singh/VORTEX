@@ -6,6 +6,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+from collections import Counter
 
 from rich.align import Align
 from rich import box
@@ -22,7 +23,14 @@ from rich.theme import Theme
 
 from config.config import Config
 from tools.base import ToolConfirmation
-from utils.model_discovery import ModelCatalogResult, flatten_model_catalog
+from utils.model_discovery import (
+    MODEL_STATUS_ORDER,
+    ModelCatalogResult,
+    flatten_model_catalog,
+    group_model_catalog_entries,
+    order_model_catalog_entries,
+)
+from utils.model_health import ModelHealthRecord
 from utils.paths import display_path_rel_to_cwd
 from utils.text import truncate_text
 
@@ -1375,6 +1383,7 @@ class TUI:
         config: Config,
         *,
         model_catalog: list[ModelCatalogResult] | None = None,
+        model_health: dict[tuple[str, str], ModelHealthRecord] | None = None,
     ) -> None:
         profile_table = Table(expand=True, box=None, padding=(0, 1))
         profile_table.add_column("Name", style="meta.value")
@@ -1406,55 +1415,100 @@ class TUI:
         )
 
         catalog_results = model_catalog or []
-        catalog_models = flatten_model_catalog(catalog_results)
-        catalog_table = Table(expand=True, box=None, padding=(0, 1))
-        catalog_table.add_column("#", style="meta.label", no_wrap=True)
-        catalog_table.add_column("Model ID", style="meta.value")
-        catalog_table.add_column("Profile", style="muted", no_wrap=True)
-        catalog_table.add_column("Base URL", style="muted")
-        catalog_table.add_column("Status", no_wrap=True)
-        catalog_table.add_column("Checked", style="muted", no_wrap=True)
-        catalog_table.add_column("Note", style="muted")
-        catalog_table.add_column("Active", style="meta.value", no_wrap=True)
+        catalog_models = order_model_catalog_entries(
+            flatten_model_catalog(
+                catalog_results,
+                health_records=model_health,
+            ),
+            active_profile_name=config.active_model_profile,
+            active_model_name=config.model_name,
+        )
+        status_counts = Counter(entry.status for entry in catalog_models)
+        grouped_models = group_model_catalog_entries(catalog_models)
 
-        for entry in catalog_models:
-            catalog_table.add_row(
-                str(entry.index),
-                entry.model_name,
-                entry.display_name,
-                entry.base_url,
-                self._model_status_text(entry.status),
-                self._format_checked_at(entry.checked_at),
-                self._short_text(entry.note),
-                (
-                    "yes"
-                    if config.active_model_profile == entry.profile_name
-                    and config.model_name == entry.model_name
-                    else ""
-                ),
-            )
+        model_sections: list[Any] = []
+        for status, entries in grouped_models:
+            status_title = self._model_status_text(status)
+            status_title.append(f" ({len(entries)})", style="muted")
 
+            section_table = Table(expand=True, box=None, padding=(0, 1))
+            section_table.add_column("#", style="meta.label", no_wrap=True)
+            section_table.add_column("Model ID", style="meta.value")
+            section_table.add_column("Profile", style="muted", no_wrap=True)
+            section_table.add_column("Base URL", style="muted")
+            section_table.add_column("Checked", style="muted", no_wrap=True)
+            section_table.add_column("Active", style="meta.value", no_wrap=True)
+
+            for entry in entries:
+                section_table.add_row(
+                    str(entry.index),
+                    entry.model_name,
+                    entry.display_name,
+                    entry.base_url,
+                    self._format_checked_at(entry.checked_at),
+                    (
+                        "yes"
+                        if config.active_model_profile == entry.profile_name
+                        and config.model_name == entry.model_name
+                        else ""
+                    ),
+                )
+
+            model_sections.extend([status_title, section_table, Text()])
+
+        provider_issue_rows: list[tuple[str, str, Text, str]] = []
         for result in catalog_results:
             if result.models:
                 continue
 
             lowered_error = (result.error or "").lower()
             status = "missing-key" if "no api key" in lowered_error else "error"
-            catalog_table.add_row(
-                "-",
-                "-",
-                result.source.display_name,
-                result.source.base_url,
-                self._model_status_text(status),
-                self._format_checked_at(result.checked_at),
-                self._short_text(result.error),
-                "",
+            provider_issue_rows.append(
+                (
+                    result.source.display_name,
+                    result.source.base_url,
+                    self._model_status_text(status),
+                    self._format_checked_at(result.checked_at),
+                )
+            )
+
+        if provider_issue_rows:
+            issues_table = Table(expand=True, box=None, padding=(0, 1))
+            issues_table.add_column("Provider", style="meta.value")
+            issues_table.add_column("Base URL", style="muted")
+            issues_table.add_column("Status", no_wrap=True)
+            issues_table.add_column("Checked", style="muted", no_wrap=True)
+
+            for provider_name, base_url, status_text, checked_at in provider_issue_rows:
+                issues_table.add_row(provider_name, base_url, status_text, checked_at)
+
+            model_sections.extend(
+                [
+                    Text("provider issues", style="warning"),
+                    issues_table,
+                ]
             )
 
         catalog_section = (
-            catalog_table
-            if catalog_models or catalog_results
+            Group(*model_sections)
+            if model_sections
             else Text("No provider-backed model listings are available.", style="muted")
+        )
+
+        summary_parts: list[str] = []
+        for status in MODEL_STATUS_ORDER:
+            count = status_counts.get(status)
+            if count:
+                summary_parts.append(f"{count} {status}")
+
+        summary_block = Group(
+            self._summary_text(summary_parts)
+            if summary_parts
+            else Text("Refresh to check live model availability.", style="muted"),
+            Text(
+                "Models are grouped from ready to degraded so the best options stay at the top.",
+                style="muted",
+            ),
         )
 
         body = Group(
@@ -1462,8 +1516,9 @@ class TUI:
             profile_section,
             Text(),
             Text("Discovered models", style="meta.label"),
+            summary_block,
             Text(
-                "Use /models refresh to refetch each provider's model list, then /model <number> to switch.",
+                "Use /models refresh to update live status, then /model <number> to switch using the grouped order shown here.",
                 style="muted",
             ),
             catalog_section,
@@ -1475,10 +1530,9 @@ class TUI:
                 body,
                 title=Text.assemble(
                     self._badge("Models", "status.info.badge"),
-                    (
-                        f" Profiles {len(profiles)} · Models {len(catalog_models)}",
-                        "panel.title",
-                    ),
+                    (f" Profiles {len(profiles)}", "panel.title"),
+                    (" · ", "muted"),
+                    (f"Models {len(catalog_models)}", "panel.title"),
                 ),
                 subtitle=Text(
                     f"active: {config.active_model_label}",

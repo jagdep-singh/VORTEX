@@ -293,7 +293,7 @@ max_output_tokens = 8192
 Runtime commands:
 
 - `/models` shows configured profiles and the models discovered for each profile
-- `/models refresh` refetches the model list from each configured provider
+- `/models refresh` refetches the model list from each configured provider and sends a tiny probe request to update each model's status
 - `/model openrouter` switches to a named profile
 - `/model use openrouter` also switches to a named profile
 - `/model 1` switches to the first discovered model

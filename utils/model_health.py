@@ -215,6 +215,41 @@ class ModelHealthChecker:
 
         return [record for record in records if record is not None]
 
+    async def probe_model(self, model: str) -> ModelHealthRecord:
+        if not model:
+            record = ModelHealthRecord.create(
+                provider=self.provider,
+                model="",
+                status="error",
+                detail="No model was specified.",
+            )
+            self.store.save_record(record)
+            return record
+
+        if not self.api_key:
+            record = ModelHealthRecord.create(
+                provider=self.provider,
+                model=model,
+                status="missing-key",
+                detail="No API key is configured for this provider.",
+            )
+            self.store.save_record(record)
+            return record
+
+        client = AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.timeout_sec,
+            max_retries=0,
+        )
+
+        try:
+            record = await self._probe_model(client, model)
+            self.store.save_record(record)
+            return record
+        finally:
+            await client.close()
+
     async def _probe_model(
         self,
         client: AsyncOpenAI,

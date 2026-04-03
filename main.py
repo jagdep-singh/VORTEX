@@ -1,4 +1,5 @@
 import asyncio
+from collections import Counter
 import contextlib
 import hashlib
 import os
@@ -27,7 +28,10 @@ from utils.model_discovery import (
     build_model_catalog_sources,
     discover_model_catalog,
     flatten_model_catalog,
+    order_model_catalog_entries,
+    select_best_working_model,
 )
+from utils.model_health import ModelHealthChecker, ModelHealthRecord, ModelHealthStore
 from utils.workspace_history import WorkspaceHistoryManager
 
 
@@ -55,6 +59,7 @@ class CLI:
         self._active_message_task: asyncio.Task[str | None] | None = None
         self.workspace_history = workspace_history or WorkspaceHistoryManager()
         self._model_catalog_store = ModelCatalogStore()
+        self._model_health_store = ModelHealthStore()
         self._model_catalog_results: list[ModelCatalogResult] | None = None
         self._model_catalog_signature: tuple[tuple[str, str, str, str], ...] | None = None
 
@@ -86,20 +91,29 @@ class CLI:
             return
 
         new_config = await self._load_config_for_workspace(target)
-        new_session = Session(config=new_config)
-        new_session.approval_manager.confirmation_callback = self.tui.handle_confirmation
-
+        previous_config = self.config
+        auto_model_notice: tuple[str, str] | None = None
+        new_session: Session | None = None
         try:
+            self.config = new_config
+            self.tui.set_config(new_config)
+            auto_model_notice = await self._ensure_working_model(reason="Workspace")
+
+            new_session = Session(config=new_config)
+            new_session.approval_manager.confirmation_callback = self.tui.handle_confirmation
             await new_session.initialize()
         except Exception:
+            self.config = previous_config
+            self.tui.set_config(previous_config)
             with contextlib.suppress(Exception):
-                await new_session.client.close()
+                if new_session is not None:
+                    await new_session.client.close()
             with contextlib.suppress(Exception):
-                await new_session.mcp_manager.shutdown()
+                if new_session is not None:
+                    await new_session.mcp_manager.shutdown()
             raise
 
         old_session = self.agent.session
-        self.config = new_config
         self.agent.config = new_config
         self.agent.session = new_session
         self.tui.set_config(new_config)
@@ -116,6 +130,8 @@ class CLI:
             f"Switched working directory to: {new_config.cwd}",
             level="success",
         )
+        if auto_model_notice:
+            self.tui.show_notice(auto_model_notice[0], level=auto_model_notice[1])
         self.tui.show_workspace_snapshot(new_session.workspace_snapshot)
         self.tui.show_code_index(new_session.code_index_summary)
 
@@ -220,12 +236,148 @@ class CLI:
     def _cached_model_catalog_entries(self) -> list[ModelCatalogEntry]:
         if not self._model_catalog_results:
             return []
-        return flatten_model_catalog(self._model_catalog_results)
+        entries = flatten_model_catalog(
+            self._model_catalog_results,
+            health_records=self._get_model_health_index(self._model_catalog_results),
+        )
+        return order_model_catalog_entries(
+            entries,
+            active_profile_name=self.config.active_model_profile,
+            active_model_name=self.config.model_name,
+        )
+
+    def _get_model_health_index(
+        self,
+        catalog_results: list[ModelCatalogResult] | None = None,
+    ) -> dict[tuple[str, str], ModelHealthRecord]:
+        results = catalog_results or self._model_catalog_results or []
+        records: dict[tuple[str, str], ModelHealthRecord] = {}
+
+        for result in results:
+            provider = result.source.display_name
+            stored_records = self._model_health_store.get_many(provider, result.models)
+            for model_name, record in stored_records.items():
+                records[(provider, model_name)] = record
+
+        return records
+
+    def _summarize_model_health_records(
+        self,
+        records: dict[tuple[str, str], ModelHealthRecord],
+    ) -> str:
+        if not records:
+            return "No models were checked."
+
+        status_counts = Counter(record.status for record in records.values())
+        parts = [f"{len(records)} checked"]
+
+        for status in (
+            "working",
+            "quota",
+            "rate-limited",
+            "auth-error",
+            "unavailable",
+            "offline",
+            "error",
+            "missing-key",
+            "cached",
+            "unknown",
+        ):
+            count = status_counts.get(status)
+            if count:
+                parts.append(f"{count} {status}")
+
+        remaining_statuses = sorted(
+            status
+            for status in status_counts
+            if status
+            not in {
+                "working",
+                "quota",
+                "rate-limited",
+                "auth-error",
+                "unavailable",
+                "offline",
+                "error",
+                "missing-key",
+                "cached",
+                "unknown",
+            }
+        )
+        for status in remaining_statuses:
+            parts.append(f"{status_counts[status]} {status}")
+
+        return " • ".join(parts)
+
+    async def _probe_model_catalog(
+        self,
+        catalog_results: list[ModelCatalogResult],
+        *,
+        status_prefix: str = "Refresh",
+    ) -> dict[tuple[str, str], ModelHealthRecord]:
+        probe_targets = [result for result in catalog_results if result.models]
+        if not probe_targets:
+            return {}
+
+        total_models = sum(len(result.models) for result in probe_targets)
+        completed_models = 0
+        records: dict[tuple[str, str], ModelHealthRecord] = {}
+
+        for provider_index, result in enumerate(probe_targets, start=1):
+            provider = result.source.display_name
+            checker = ModelHealthChecker(
+                provider=provider,
+                base_url=result.source.base_url,
+                api_key=result.source.api_key,
+                store=self._model_health_store,
+            )
+
+            self.tui.show_status(
+                f"{status_prefix}: "
+                f"checking provider {provider_index}/{len(probe_targets)}"
+                f" • {provider}"
+                f" • {completed_models}/{total_models} models"
+            )
+
+            async def _progress(
+                _done: int,
+                _total: int,
+                record: ModelHealthRecord,
+            ) -> None:
+                nonlocal completed_models
+                completed_models += 1
+                records[(record.provider, record.model)] = record
+                self.tui.show_status(
+                    f"{status_prefix}: "
+                    f"checking models {completed_models}/{total_models}"
+                    f" • {record.provider}"
+                )
+
+            try:
+                provider_records = await checker.probe_models(
+                    result.models,
+                    progress_callback=_progress,
+                )
+            except Exception as exc:
+                self.tui.show_notice(
+                    f"Failed to probe models for {provider}: {exc}",
+                    level="warning",
+                )
+                continue
+
+            for record in provider_records:
+                records[(record.provider, record.model)] = record
+
+        return records
 
     async def _get_model_catalog(
         self,
         *,
         refresh: bool = False,
+        probe: bool = False,
+        status_prefix: str = "Models",
+        show_cached_notice: bool = True,
+        completion_notice: str | None = None,
     ) -> list[ModelCatalogResult]:
         signature = self._current_catalog_signature()
         if (
@@ -235,39 +387,139 @@ class CLI:
         ):
             return self._model_catalog_results
 
-        self.tui.show_status("Loading models from configured providers...")
+        self.tui.show_status(f"{status_prefix}: loading configured providers")
         try:
             live_results = await discover_model_catalog(self.config)
+            results: list[ModelCatalogResult] = []
+            cached_sources: list[str] = []
+            for result in live_results:
+                if result.error:
+                    cached_result = self._model_catalog_store.get(result.source)
+                    if cached_result is not None:
+                        cached_result.error = result.error
+                        results.append(cached_result)
+                        cached_sources.append(result.source.display_name)
+                        continue
+
+                    results.append(result)
+                    continue
+
+                self._model_catalog_store.save(result)
+                results.append(result)
+
+            probe_records: dict[tuple[str, str], ModelHealthRecord] = {}
+            if probe:
+                probe_records = await self._probe_model_catalog(
+                    results,
+                    status_prefix=status_prefix,
+                )
+
+            self._model_catalog_results = results
+            self._model_catalog_signature = signature
+
+            if cached_sources and show_cached_notice:
+                self.tui.show_notice(
+                    "Using cached model list for: " + ", ".join(cached_sources),
+                    level="warning",
+                )
+
+            if probe and completion_notice:
+                self.tui.show_notice(
+                    completion_notice + ": "
+                    + self._summarize_model_health_records(probe_records),
+                    level="success",
+                )
+
+            return results
         finally:
             self.tui.clear_status()
 
-        results: list[ModelCatalogResult] = []
-        cached_sources: list[str] = []
-        for result in live_results:
-            if result.error:
-                cached_result = self._model_catalog_store.get(result.source)
-                if cached_result is not None:
-                    cached_result.error = result.error
-                    results.append(cached_result)
-                    cached_sources.append(result.source.display_name)
-                    continue
+    async def _probe_current_model_if_needed(
+        self,
+        health_records: dict[tuple[str, str], ModelHealthRecord],
+        *,
+        status_prefix: str,
+    ) -> ModelHealthRecord | None:
+        provider = self.config.active_model_profile or "default"
+        model_name = self.config.model_name
+        record_key = (provider, model_name)
 
-                results.append(result)
-                continue
+        existing = health_records.get(record_key)
+        if existing is not None:
+            return existing
 
-            self._model_catalog_store.save(result)
-            results.append(result)
+        checker = ModelHealthChecker(
+            provider=provider,
+            base_url=self.config.base_url,
+            api_key=self.config.api_key,
+            store=self._model_health_store,
+        )
+        self.tui.show_status(
+            f"{status_prefix}: checking current model"
+            f" • {provider}"
+        )
+        record = await checker.probe_model(model_name)
+        health_records[record_key] = record
+        return record
 
-        self._model_catalog_results = results
-        self._model_catalog_signature = signature
+    async def _ensure_working_model(
+        self,
+        *,
+        reason: str,
+    ) -> tuple[str, str] | None:
+        catalog_results = await self._get_model_catalog(
+            refresh=True,
+            probe=True,
+            status_prefix=reason,
+            show_cached_notice=False,
+            completion_notice=None,
+        )
+        health_records = self._get_model_health_index(catalog_results)
+        current_record = await self._probe_current_model_if_needed(
+            health_records,
+            status_prefix=reason,
+        )
 
-        if cached_sources:
-            self.tui.show_notice(
-                "Using cached model list for: " + ", ".join(cached_sources),
-                level="warning",
+        current_profile_name = self.config.active_model_profile
+        current_model_name = self.config.model_name
+
+        if current_record and current_record.status == "working":
+            return None
+
+        selected_entry = select_best_working_model(
+            catalog_results,
+            health_records=health_records,
+            preferred_profile_name=current_profile_name,
+            preferred_model_name=current_model_name,
+        )
+        if selected_entry is None:
+            return (
+                f"No working model was found during {reason.lower()} checks. "
+                f"Staying on {self.config.active_model_label}.",
+                "warning",
             )
 
-        return results
+        if (
+            selected_entry.profile_name == current_profile_name
+            and selected_entry.model_name == current_model_name
+        ):
+            return None
+
+        previous_label = self.config.active_model_label
+        self.config.active_model_profile = selected_entry.profile_name
+        self.config.model_name = selected_entry.model_name
+        await self._reset_model_client()
+
+        selected_label = (
+            f"{selected_entry.display_name} ({selected_entry.model_name})"
+            if selected_entry.profile_name is not None
+            else selected_entry.model_name
+        )
+        return (
+            f"Auto-selected a working model: {selected_label} "
+            f"(previously {previous_label}).",
+            "success",
+        )
 
     def _select_preferred_catalog_entry(
         self,
@@ -285,6 +537,9 @@ class CLI:
 
     async def run_single(self, message: str) -> str | None:
         try:
+            startup_notice = await self._ensure_working_model(reason="Startup")
+            if startup_notice:
+                self.tui.show_notice(startup_notice[0], level=startup_notice[1])
             async with Agent(self.config) as agent:
                 self.agent = agent
                 return await self._process_message(message)
@@ -292,7 +547,11 @@ class CLI:
             self.tui.clear_status()
 
     async def run_interactive(self) -> str | None:
+        startup_notice = await self._ensure_working_model(reason="Startup")
+        self.tui.clear_screen()
         self.tui.print_welcome()
+        if startup_notice:
+            self.tui.show_notice(startup_notice[0], level=startup_notice[1])
 
         try:
             async with Agent(
@@ -497,7 +756,12 @@ class CLI:
         elif cmd_name_lower == "/models":
             action = cmd_args.strip().lower()
             if action == "refresh":
-                model_catalog = await self._get_model_catalog(refresh=True)
+                model_catalog = await self._get_model_catalog(
+                    refresh=True,
+                    probe=True,
+                    status_prefix="Refresh",
+                    completion_notice="Model refresh complete",
+                )
             elif action:
                 self.tui.show_notice(
                     "Usage: /models or /models refresh",
@@ -509,10 +773,25 @@ class CLI:
             self.tui.show_model_profiles(
                 self.config,
                 model_catalog=model_catalog,
+                model_health=self._get_model_health_index(model_catalog),
             )
         elif cmd_name_lower == "/model":
             if cmd_args:
                 target = cmd_args.strip()
+                if target.lower() == "refresh":
+                    model_catalog = await self._get_model_catalog(
+                        refresh=True,
+                        probe=True,
+                        status_prefix="Refresh",
+                        completion_notice="Model refresh complete",
+                    )
+                    self.tui.show_model_profiles(
+                        self.config,
+                        model_catalog=model_catalog,
+                        model_health=self._get_model_health_index(model_catalog),
+                    )
+                    return True
+
                 profile_name = None
                 force_switch = False
 
@@ -544,8 +823,13 @@ class CLI:
                     except ValueError as exc:
                         self.tui.show_notice(str(exc), level="error")
                 elif target.isdigit():
-                    catalog_models = flatten_model_catalog(
-                        await self._get_model_catalog()
+                    catalog_models = order_model_catalog_entries(
+                        flatten_model_catalog(
+                            await self._get_model_catalog(),
+                            health_records=self._get_model_health_index(),
+                        ),
+                        active_profile_name=self.config.active_model_profile,
+                        active_model_name=self.config.model_name,
                     )
                     selected_index = int(target) - 1
                     if 0 <= selected_index < len(catalog_models):
