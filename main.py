@@ -43,6 +43,12 @@ from utils.model_discovery import (
     select_best_working_model,
 )
 from utils.model_health import ModelHealthChecker, ModelHealthRecord, ModelHealthStore
+from utils.versioning import (
+    ReleaseInfo,
+    VersionManager,
+    get_current_version,
+    recommended_update_instruction,
+)
 from utils.workspace_history import WorkspaceHistoryManager
 
 
@@ -85,12 +91,15 @@ class CLI:
         self,
         config: Config,
         workspace_history: WorkspaceHistoryManager | None = None,
+        version_manager: VersionManager | None = None,
     ):
         self.agent: Agent | None = None
         self.config = config
         self.tui = TUI(config, console)
         self._active_message_task: asyncio.Task[str | None] | None = None
         self.workspace_history = workspace_history or WorkspaceHistoryManager()
+        self.version_manager = version_manager or VersionManager(project_root=PROJECT_ROOT)
+        self.release_info: ReleaseInfo | None = None
         self._model_catalog_store = ModelCatalogStore()
         self._model_health_store = ModelHealthStore()
         self._model_catalog_results: list[ModelCatalogResult] | None = None
@@ -623,10 +632,21 @@ class CLI:
 
     async def run_interactive(self) -> str | None:
         startup_notice = await self._ensure_working_model(reason="Startup")
+        self.tui.show_status("Startup: checking for new VORTEX releases")
+        self.release_info = await asyncio.to_thread(self.version_manager.get_release_info)
+        self.tui.clear_status()
         self.tui.clear_screen()
-        self.tui.print_welcome()
+        self.tui.print_welcome(release_info=self.release_info)
         if startup_notice:
             self.tui.show_notice(startup_notice[0], level=startup_notice[1])
+        if self.release_info and self.release_info.update_available:
+            assert self.release_info.latest_version is not None
+            self.tui.show_notice(
+                "Update available: "
+                f"{self.release_info.current_version} -> {self.release_info.latest_version}. "
+                f"{recommended_update_instruction(self.release_info.install_mode).capitalize()} when you're ready.",
+                level="warning",
+            )
 
         try:
             async with Agent(
@@ -1156,6 +1176,33 @@ def _load_validated_config(requested_cwd: Path) -> Config:
     return config
 
 
+def _run_update_flow() -> int:
+    version_manager = VersionManager(project_root=PROJECT_ROOT)
+    current_version = version_manager.current_version
+    release_info = version_manager.get_release_info()
+
+    console.print(
+        f"[info]VORTEX {current_version}[/info]",
+    )
+    if release_info.latest_version and release_info.update_available:
+        console.print(
+            "[warning]"
+            f"New version available: {release_info.latest_version}"
+            "[/warning]"
+        )
+
+    update_command = version_manager.resolve_update_command()
+    if update_command is not None:
+        console.print(
+            f"[muted]Running update command: {update_command.display}[/muted]"
+        )
+
+    result = version_manager.perform_self_update()
+    level = "success" if result.success else "error"
+    console.print(f"[{level}]{result.message}[/{level}]")
+    return 0 if result.success else 1
+
+
 async def _prompt_for_missing_api_credentials(
     *,
     requested_cwd: Path,
@@ -1464,6 +1511,10 @@ def _choose_startup_workspace(
 
 
 @click.command()
+@click.version_option(
+    version=get_current_version(PROJECT_ROOT),
+    prog_name="vortex",
+)
 @click.argument("prompt", required=False)
 @click.option(
     "--cwd",
@@ -1471,10 +1522,19 @@ def _choose_startup_workspace(
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     help="Current working directory",
 )
+@click.option(
+    "--update",
+    is_flag=True,
+    help="Upgrade the installed vortex-agent-cli package and exit.",
+)
 def main(
     prompt: str | None,
     cwd: Path | None,
+    update: bool,
 ):
+    if update:
+        sys.exit(_run_update_flow())
+
     workspace_history = WorkspaceHistoryManager()
 
     try:

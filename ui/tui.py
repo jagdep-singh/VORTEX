@@ -35,6 +35,7 @@ from utils.model_discovery import (
 from utils.model_health import ModelHealthRecord
 from utils.paths import display_path_rel_to_cwd
 from utils.text import truncate_text
+from utils.versioning import ReleaseInfo
 
 try:
     from prompt_toolkit import PromptSession
@@ -109,6 +110,26 @@ class TUI:
     _PROMPT_MARKER = "╰─"
     _WORKSPACE_PROMPT_LABEL = "workspace"
     _STATUS_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    _WORKSPACE_ART = "\n".join(
+        [
+            "__        __         _                                  ",
+            "\\ \\      / /__  _ __| | _____ _ __   __ _  ___ ___     ",
+            " \\ \\ /\\ / / _ \\| '__| |/ / __| '_ \\ / _` |/ __/ _ \\ ",
+            "  \\ V  V / (_) | |  |   <\\__ \\ |_) | (_| | (_|  __/ ",
+            "   \\_/\\_/ \\___/|_|  |_|\\_\\___/ .__/ \\__,_|\\___\\___|",
+            "                             |_|                      ",
+        ]
+    )
+    _API_ART = "\n".join(
+        [
+            "    ___    ____  ____     _____      __                ",
+            "   /   |  / __ \\/  _/    / ___/___  / /___  ______     ",
+            "  / /| | / /_/ // /      \\__ \\/ _ \\/ __/ / / / __ \\ ",
+            " / ___ |/ ____// /      ___/ /  __/ /_/ /_/ / /_/ /    ",
+            "/_/  |_/_/   /___/     /____/\\___/\\__/\\__,_/ .___/ ",
+            "                                          /_/          ",
+        ]
+    )
     _ASSISTANT_AURORA = (
         "#102636",
         "#153244",
@@ -128,6 +149,18 @@ class TUI:
         "#152029",
         "#192733",
         "#1d2f3c",
+    )
+    _AURORA_BAR = (
+        "#0c1b2a",
+        "#12263a",
+        "#1b3148",
+        "#234156",
+        "#2c5467",
+        "#376779",
+        "#2c5467",
+        "#234156",
+        "#1b3148",
+        "#12263a",
     )
     _LOGO = "\n".join(
         [
@@ -267,6 +300,33 @@ class TUI:
             box=box.ROUNDED,
             padding=padding,
         )
+
+    def _print_startup_art(self, art: str, label: str) -> None:
+        self.console.print()
+        self.console.print(Align.center(Text(art, style="brand")))
+        self.console.print(
+            Rule(
+                Text(label.upper(), style="muted"),
+                style="panel.border",
+            )
+        )
+
+    def _aurora_bar(self, label: str | None = None) -> Text:
+        width = max(self.console.width - 2, 40)
+        bar_text = Text()
+        palette = self._AURORA_BAR
+        label = label or ""
+        label_start = (width - len(label)) // 2 if label else -1
+
+        for i in range(width):
+            color = palette[i % len(palette)]
+            if label and label_start <= i < label_start + len(label):
+                char = label[i - label_start]
+                bar_text.append(char, style=Style(color="#e7fbff", bgcolor=color, bold=True))
+            else:
+                bar_text.append("▄", style=Style(color=color))
+
+        return bar_text
 
     def _kv_table(
         self,
@@ -501,6 +561,8 @@ class TUI:
             table.add_row(index, directory, note)
 
         self.clear_screen()
+        self._print_startup_art(self._WORKSPACE_ART, "workspace setup")
+        self.console.print(self._aurora_bar("choose your canvas"))
         messages: list[Any] = [
             Text("Choose a working directory for this session.", style="muted"),
             Text(
@@ -564,6 +626,8 @@ class TUI:
         info_message: str | None = None,
     ) -> str:
         self.clear_screen()
+        self._print_startup_art(self._WORKSPACE_ART, "custom workspace")
+        self.console.print(self._aurora_bar("enter a path"))
         body: list[Any] = [
             Text("Enter a project directory to use as the active workspace.", style="muted"),
             Text(
@@ -624,6 +688,8 @@ class TUI:
         info_message: str | None = None,
     ) -> str:
         self.clear_screen()
+        self._print_startup_art(self._API_ART, "provider setup")
+        self.console.print(self._aurora_bar("connect your api"))
         body: list[Any] = [
             Text(
                 "VORTEX needs an OpenAI-compatible provider URL before it can start.",
@@ -704,6 +770,8 @@ class TUI:
         info_message: str | None = None,
     ) -> str:
         self.clear_screen()
+        self._print_startup_art(self._API_ART, "api key setup")
+        self.console.print(self._aurora_bar("secure access"))
         body: list[Any] = [
             Text(
                 "Enter the API key for the provider you want this workspace to use.",
@@ -762,15 +830,22 @@ class TUI:
             password=True,
         )
 
-    def print_welcome(self) -> None:
+    def print_welcome(self, *, release_info: ReleaseInfo | None = None) -> None:
         self._pause_live_status()
         workspace = self._home_relative(self.config.cwd)
         rows = [
+            (
+                "Version",
+                release_info.current_version if release_info is not None else "unknown",
+            ),
             ("Model", self.config.model_name),
             ("Workspace", workspace),
             ("Approval", self.config.approval.value),
             ("Turns", f"{self.config.max_turns} max"),
         ]
+        if release_info is not None and release_info.update_available:
+            assert release_info.latest_version is not None
+            rows.insert(1, ("Update", f"{release_info.latest_version} available"))
         quick_actions = [
             ("/help", "Show the full command reference"),
             ("/scan", "Refresh workspace context"),
@@ -784,10 +859,18 @@ class TUI:
         self.console.print(Align.center(Text(self._LOGO, style="brand")))
         self.console.print(
             Rule(
-                Text("VORTEX TERMINAL · LOCAL AGENT · LIVE TOOLS", style="muted"),
+                Text.assemble(
+                    ("VORTEX TERMINAL", "muted"),
+                    (
+                        f" · v{release_info.current_version}" if release_info is not None else "",
+                        "muted",
+                    ),
+                    (" · LOCAL AGENT · LIVE TOOLS", "muted"),
+                ),
                 style="panel.border",
             )
         )
+        self.console.print(self._aurora_bar("the terminal is your studio"))
         self.console.print()
         self.console.print(
             Columns(
@@ -840,136 +923,170 @@ class TUI:
     def begin_assistant(self) -> None:
         self._pause_live_status()
         self.console.print()
-        self.console.print(
-            Rule(
-                Text.assemble(
-                    self._badge("Agent", "assistant.badge"),
-                    (" VORTEX", "assistant.badge"),
-                ),
-                style="panel.border",
-            )
-        )
         self._assistant_stream_open = True
-        self._assistant_mode = "text"
-        self._assistant_pending_backticks = ""
-        self._assistant_fence_header_pending = False
+        self._assistant_buffer = ""
+        self._assistant_animation_phase = 0
+        self._assistant_live = Live(
+            self._render_assistant_panel(streaming=True),
+            console=self.console,
+            auto_refresh=False,
+            transient=True,
+        )
+        self._assistant_live.start()
 
     def end_assistant(self) -> None:
-        self._finalize_assistant_pending_backticks()
+        if self._assistant_live is not None:
+            self._assistant_live.stop()
+            self._assistant_live = None
         if self._assistant_stream_open:
+            self.console.print(self._render_assistant_panel(streaming=False))
             self.console.print()
         self._assistant_stream_open = False
-        self._assistant_mode = "text"
-        self._assistant_pending_backticks = ""
-        self._assistant_fence_header_pending = False
+        self._assistant_buffer = ""
+        self._assistant_animation_phase = 0
 
-    def _assistant_text_style(self) -> str:
-        if self._assistant_mode == "inline_code":
+    def _assistant_text_style_for_mode(self, mode: str) -> str:
+        if mode == "inline_code":
             return "assistant.inline_code"
-        if self._assistant_mode == "fenced_code":
+        if mode == "fenced_code":
             return "assistant.code_block"
         return "assistant"
 
-    def _flush_assistant_pending_backticks(self) -> None:
-        if not self._assistant_pending_backticks:
-            return
+    def _assistant_background_color(self, mode: str, line_index: int, column: int) -> str:
+        if mode == "inline_code":
+            palette = self._ASSISTANT_INLINE_AURORA
+        elif mode == "fenced_code":
+            palette = self._ASSISTANT_CODE_AURORA
+        else:
+            palette = self._ASSISTANT_AURORA
 
-        self.console.print(
-            Text(self._assistant_pending_backticks, style=self._assistant_text_style()),
-            end="",
-        )
-        self._assistant_pending_backticks = ""
+        band = ((column // 6) + line_index + self._assistant_animation_phase) % len(palette)
+        return palette[band]
 
-    def _finalize_assistant_pending_backticks(self) -> None:
-        if not self._assistant_pending_backticks:
-            return
-
-        tick_count = len(self._assistant_pending_backticks)
-
-        if tick_count == 1 and self._assistant_mode == "inline_code":
-            self._assistant_pending_backticks = ""
-            self._assistant_mode = "text"
-            return
-
-        if tick_count >= 3 and self._assistant_mode == "fenced_code":
-            self._assistant_pending_backticks = ""
-            self._assistant_mode = "text"
-            self._assistant_fence_header_pending = False
-            return
-
-        self._flush_assistant_pending_backticks()
-
-    def stream_assistant_delta(self, content: str) -> None:
-        text = f"{self._assistant_pending_backticks}{content}"
-        self._assistant_pending_backticks = ""
-
+    def _render_assistant_text(self, content: str) -> Text:
         rendered = Text()
-        segment_buffer: list[str] = []
-        segment_style = self._assistant_text_style()
+        mode = "text"
+        fence_header_pending = False
+        line_index = 0
+        column = 0
+        base_styles = {
+            "text": self.console.get_style(self._assistant_text_style_for_mode("text")),
+            "inline_code": self.console.get_style(
+                self._assistant_text_style_for_mode("inline_code")
+            ),
+            "fenced_code": self.console.get_style(
+                self._assistant_text_style_for_mode("fenced_code")
+            ),
+        }
 
-        def flush_segment() -> None:
-            nonlocal segment_buffer
-            if segment_buffer:
-                rendered.append("".join(segment_buffer), style=segment_style)
-                segment_buffer = []
+        def append_char(char: str) -> None:
+            nonlocal line_index, column
+
+            if char == "\n":
+                rendered.append(char, style=base_styles[mode])
+                line_index += 1
+                column = 0
+                return
+
+            background = self._assistant_background_color(mode, line_index, column)
+            rendered.append(char, style=base_styles[mode] + Style(bgcolor=background))
+            column += 1
 
         i = 0
-        while i < len(text):
-            char = text[i]
+        while i < len(content):
+            char = content[i]
 
-            if self._assistant_fence_header_pending:
+            if fence_header_pending:
                 if char == "\n":
-                    self._assistant_fence_header_pending = False
-                    new_style = self._assistant_text_style()
-                    if new_style != segment_style:
-                        flush_segment()
-                    segment_style = new_style
-                    segment_buffer.append(char)
+                    fence_header_pending = False
+                    append_char(char)
                 i += 1
                 continue
 
             if char == "`":
                 run_end = i
-                while run_end < len(text) and text[run_end] == "`":
+                while run_end < len(content) and content[run_end] == "`":
                     run_end += 1
 
-                tick_run = text[i:run_end]
-                if run_end == len(text):
-                    self._assistant_pending_backticks = tick_run
-                    break
+                tick_run = content[i:run_end]
+                if run_end == len(content):
+                    if len(tick_run) == 1 and mode == "inline_code":
+                        mode = "text"
+                        i = run_end
+                        continue
+                    if len(tick_run) >= 3 and mode == "fenced_code":
+                        mode = "text"
+                        fence_header_pending = False
+                        i = run_end
+                        continue
+                    for tick in tick_run:
+                        append_char(tick)
+                    i = run_end
+                    continue
 
-                flush_segment()
-
-                if len(tick_run) >= 3 and self._assistant_mode != "inline_code":
-                    if self._assistant_mode == "fenced_code":
-                        self._assistant_mode = "text"
+                if len(tick_run) >= 3 and mode != "inline_code":
+                    if mode == "fenced_code":
+                        mode = "text"
                     else:
-                        self._assistant_mode = "fenced_code"
-                        self._assistant_fence_header_pending = True
-                    segment_style = self._assistant_text_style()
-                elif len(tick_run) == 1 and self._assistant_mode != "fenced_code":
-                    self._assistant_mode = (
-                        "text" if self._assistant_mode == "inline_code" else "inline_code"
-                    )
-                    segment_style = self._assistant_text_style()
+                        mode = "fenced_code"
+                        fence_header_pending = True
+                elif len(tick_run) == 1 and mode != "fenced_code":
+                    mode = "text" if mode == "inline_code" else "inline_code"
                 else:
-                    rendered.append(tick_run, style=self._assistant_text_style())
-                    segment_style = self._assistant_text_style()
+                    for tick in tick_run:
+                        append_char(tick)
 
                 i = run_end
                 continue
 
-            new_style = self._assistant_text_style()
-            if new_style != segment_style:
-                flush_segment()
-                segment_style = new_style
-            segment_buffer.append(char)
+            append_char(char)
             i += 1
 
-        flush_segment()
+        return rendered
 
-        if rendered:
-            self.console.print(rendered, end="")
+    def _render_assistant_panel(self, *, streaming: bool) -> Panel:
+        body = self._render_assistant_text(self._assistant_buffer)
+        if not body.plain:
+            body = Text(
+                "Thinking through the reply...",
+                style=Style(color="#d6f5ff", bgcolor=self._ASSISTANT_AURORA[0]),
+            )
+
+        title = Text.assemble(
+            self._badge("Agent", "assistant.badge"),
+            (" VORTEX", "assistant.panel.title"),
+            (" Response", "assistant.panel.title"),
+        )
+        subtitle = Text(
+            "streaming" if streaming else "complete",
+            style="assistant.panel.subtitle",
+        )
+        return Panel(
+            body,
+            title=title,
+            title_align="left",
+            subtitle=subtitle,
+            subtitle_align="right",
+            border_style="assistant.panel.border",
+            box=box.ROUNDED,
+            padding=(1, 2),
+            style=Style(bgcolor="#0b131b"),
+        )
+
+    def stream_assistant_delta(self, content: str) -> None:
+        if not content:
+            return
+
+        self._assistant_buffer += content
+        self._assistant_animation_phase = (
+            self._assistant_animation_phase + 1
+        ) % len(self._ASSISTANT_AURORA)
+
+        if self._assistant_live is not None:
+            self._assistant_live.update(
+                self._render_assistant_panel(streaming=True),
+                refresh=True,
+            )
 
     def show_status(self, message: str) -> None:
         if self._status_suspended:
@@ -1959,6 +2076,7 @@ class TUI:
                 Text("Tool calls, approvals, and outputs are shown as structured cards.", style="muted"),
                 Text("Use /cwd to switch projects; the session reloads for the new directory.", style="muted"),
                 Text("Use /index or the find_symbol tool to jump to definitions faster.", style="muted"),
+                Text("Use vortex --update outside the app to install the latest published release.", style="muted"),
                 Text(
                     "Add custom providers in .ai-agent/config.toml with [models.<name>].",
                     style="muted",
