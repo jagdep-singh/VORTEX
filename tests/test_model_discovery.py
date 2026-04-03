@@ -7,11 +7,14 @@ from unittest.mock import patch
 
 from config.config import Config
 from utils.model_discovery import (
+    MODEL_BUCKET_ORDER,
     ModelCatalogResult,
     ModelCatalogSource,
     ModelCatalogStore,
     build_model_catalog_sources,
     flatten_model_catalog,
+    group_model_catalog_entries_by_bucket,
+    model_status_bucket,
     order_model_catalog_entries,
     select_best_working_model,
 )
@@ -19,6 +22,13 @@ from utils.model_health import ModelHealthRecord
 
 
 class ModelDiscoveryConfigTests(unittest.TestCase):
+    def test_model_status_bucket_collapses_detailed_errors(self) -> None:
+        self.assertEqual(model_status_bucket("working"), "working")
+        self.assertEqual(model_status_bucket("quota"), "quota")
+        self.assertEqual(model_status_bucket("rate-limited"), "quota")
+        self.assertEqual(model_status_bucket("auth-error"), "not-working")
+        self.assertEqual(model_status_bucket("unknown"), "not-working")
+
     def test_profile_prefers_its_own_env_key(self) -> None:
         with patch.dict(
             "os.environ",
@@ -278,6 +288,62 @@ class ModelDiscoveryConfigTests(unittest.TestCase):
         assert selected is not None
         self.assertEqual(selected.profile_name, "healthy")
         self.assertEqual(selected.model_name, "healthy-model")
+
+    def test_group_model_catalog_entries_by_bucket_preserves_bucket_order(self) -> None:
+        entries = [
+            *flatten_model_catalog(
+                [
+                    ModelCatalogResult(
+                        source=ModelCatalogSource(
+                            profile_name="demo",
+                            display_name="demo",
+                            base_url="https://example.com/v1",
+                            api_key="key-1",
+                            key_source_label="env:API_KEY",
+                            is_active=True,
+                        ),
+                        models=["quota-model", "broken-model", "working-model"],
+                        checked_at="2026-04-01T00:00:00+00:00",
+                    )
+                ],
+                health_records={
+                    ("demo", "quota-model"): ModelHealthRecord(
+                        provider="demo",
+                        model="quota-model",
+                        status="quota",
+                        checked_at="2026-04-01T01:00:00+00:00",
+                    ),
+                    ("demo", "broken-model"): ModelHealthRecord(
+                        provider="demo",
+                        model="broken-model",
+                        status="auth-error",
+                        checked_at="2026-04-01T01:05:00+00:00",
+                    ),
+                    ("demo", "working-model"): ModelHealthRecord(
+                        provider="demo",
+                        model="working-model",
+                        status="working",
+                        checked_at="2026-04-01T01:10:00+00:00",
+                    ),
+                },
+            )
+        ]
+        ordered_entries = order_model_catalog_entries(
+            entries,
+            active_profile_name="demo",
+            active_model_name="working-model",
+        )
+
+        grouped = group_model_catalog_entries_by_bucket(ordered_entries)
+
+        self.assertEqual(
+            [bucket for bucket, _entries in grouped],
+            [bucket for bucket in MODEL_BUCKET_ORDER if any(model_status_bucket(entry.status) == bucket for entry in ordered_entries)],
+        )
+        self.assertEqual(
+            [[entry.model_name for entry in bucket_entries] for _bucket, bucket_entries in grouped],
+            [["working-model"], ["quota-model"], ["broken-model"]],
+        )
 
     def test_order_model_catalog_entries_sorts_by_status_priority(self) -> None:
         results = [

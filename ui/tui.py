@@ -24,10 +24,11 @@ from rich.theme import Theme
 from config.config import Config
 from tools.base import ToolConfirmation
 from utils.model_discovery import (
-    MODEL_STATUS_ORDER,
+    MODEL_BUCKET_ORDER,
     ModelCatalogResult,
     flatten_model_catalog,
-    group_model_catalog_entries,
+    group_model_catalog_entries_by_bucket,
+    model_status_bucket,
     order_model_catalog_entries,
 )
 from utils.model_health import ModelHealthRecord
@@ -286,6 +287,20 @@ class TUI:
         }
         return Text(label, style=style_map.get(label, "muted"))
 
+    def _model_bucket_text(self, bucket: str | None) -> Text:
+        label = bucket or "not-working"
+        style_map = {
+            "working": "success",
+            "quota": "warning",
+            "not-working": "error",
+        }
+        text_map = {
+            "working": "working",
+            "quota": "quota",
+            "not-working": "not working",
+        }
+        return Text(text_map.get(label, label), style=style_map.get(label, "muted"))
+
     def _format_checked_at(self, checked_at: str | None) -> str:
         if not checked_at:
             return "-"
@@ -378,6 +393,30 @@ class TUI:
             [
                 ("", "\n"),
                 ("fg:#00e5e5", "path "),
+                ("fg:#555555", "› "),
+            ]
+        )
+
+    def _provider_prompt_message(self):
+        if FormattedText is None:
+            return None
+
+        return FormattedText(
+            [
+                ("", "\n"),
+                ("fg:#00e5e5", "provider "),
+                ("fg:#555555", "› "),
+            ]
+        )
+
+    def _api_key_prompt_message(self):
+        if FormattedText is None:
+            return None
+
+        return FormattedText(
+            [
+                ("", "\n"),
+                ("fg:#00e5e5", "api key "),
                 ("fg:#555555", "› "),
             ]
         )
@@ -548,6 +587,155 @@ class TUI:
             "[meta.label]path[/meta.label] [prompt.hint]›[/prompt.hint]",
             console=self.console,
             default="",
+        )
+
+    async def prompt_api_provider_url(
+        self,
+        *,
+        workspace_dir: Path,
+        default_url: str,
+        api_key_env_name: str,
+        docs_path: Path | None = None,
+        error_message: str | None = None,
+        info_message: str | None = None,
+    ) -> str:
+        self.clear_screen()
+        body: list[Any] = [
+            Text(
+                "VORTEX needs an OpenAI-compatible provider URL before it can start.",
+                style="muted",
+            ),
+            Text(
+                f"Workspace: {self._home_relative(workspace_dir)}",
+                style="meta.value",
+            ),
+            Text(
+                f"Saved to: {self._home_relative(workspace_dir / '.env')}",
+                style="meta.value",
+            ),
+            Text(
+                f"API key variable: {api_key_env_name}",
+                style="meta.value",
+            ),
+        ]
+
+        if error_message:
+            body.extend([Text(), Text(error_message, style="error")])
+        elif info_message:
+            body.extend([Text(), Text(info_message, style="warning")])
+
+        body.extend(
+            [
+                Text(),
+                Text("Common provider URLs:", style="meta.label"),
+                Text("https://api.openai.com/v1", style="meta.value"),
+                Text("https://openrouter.ai/api/v1", style="meta.value"),
+                Text("http://localhost:11434/v1", style="meta.value"),
+            ]
+        )
+
+        if docs_path is not None:
+            body.extend(
+                [
+                    Text(),
+                    Text(
+                        f"Need help choosing one? See {self._home_relative(docs_path)}",
+                        style="muted",
+                    ),
+                ]
+            )
+
+        self.console.print(
+            self._panel(
+                Group(*body),
+                title=Text.assemble(
+                    self._badge("API", "status.info.badge"),
+                    (" Provider setup", "panel.title"),
+                ),
+                subtitle=Text("startup", style="panel.subtitle"),
+            )
+        )
+
+        if self._prompt_session is not None:
+            return await self._prompt_session.prompt_async(
+                self._provider_prompt_message(),
+                default=default_url,
+                mouse_support=False,
+            )
+
+        return Prompt.ask(
+            "[meta.label]provider[/meta.label] [prompt.hint]›[/prompt.hint]",
+            console=self.console,
+            default=default_url,
+        )
+
+    async def prompt_api_key(
+        self,
+        *,
+        workspace_dir: Path,
+        provider_url: str,
+        api_key_env_name: str,
+        docs_path: Path | None = None,
+        error_message: str | None = None,
+        info_message: str | None = None,
+    ) -> str:
+        self.clear_screen()
+        body: list[Any] = [
+            Text(
+                "Enter the API key for the provider you want this workspace to use.",
+                style="muted",
+            ),
+            Text(
+                f"Provider URL: {provider_url}",
+                style="meta.value",
+            ),
+            Text(
+                f"Saved to: {self._home_relative(workspace_dir / '.env')} as {api_key_env_name}",
+                style="meta.value",
+            ),
+            Text("The key is hidden while you type.", style="muted"),
+        ]
+
+        if error_message:
+            body.extend([Text(), Text(error_message, style="error")])
+        elif info_message:
+            body.extend([Text(), Text(info_message, style="warning")])
+
+        if docs_path is not None:
+            body.extend(
+                [
+                    Text(),
+                    Text(
+                        f"Need help getting a key? See {self._home_relative(docs_path)}",
+                        style="muted",
+                    ),
+                ]
+            )
+
+        self.console.print(
+            self._panel(
+                Group(*body),
+                title=Text.assemble(
+                    self._badge("API", "status.info.badge"),
+                    (" Key setup", "panel.title"),
+                ),
+                subtitle=Text("startup", style="panel.subtitle"),
+            )
+        )
+
+        if self._prompt_session is not None:
+            return await self._prompt_session.prompt_async(
+                self._api_key_prompt_message(),
+                default="",
+                is_password=True,
+                mouse_support=False,
+            )
+
+        return Prompt.ask(
+            "[meta.label]api key[/meta.label] [prompt.hint]›[/prompt.hint]",
+            console=self.console,
+            default="",
+            password=True,
         )
 
     def print_welcome(self) -> None:
@@ -1423,18 +1611,19 @@ class TUI:
             active_profile_name=config.active_model_profile,
             active_model_name=config.model_name,
         )
-        status_counts = Counter(entry.status for entry in catalog_models)
-        grouped_models = group_model_catalog_entries(catalog_models)
+        bucket_counts = Counter(model_status_bucket(entry.status) for entry in catalog_models)
+        grouped_models = group_model_catalog_entries_by_bucket(catalog_models)
 
         model_sections: list[Any] = []
-        for status, entries in grouped_models:
-            status_title = self._model_status_text(status)
+        for bucket, entries in grouped_models:
+            status_title = self._model_bucket_text(bucket)
             status_title.append(f" ({len(entries)})", style="muted")
 
             section_table = Table(expand=True, box=None, padding=(0, 1))
             section_table.add_column("#", style="meta.label", no_wrap=True)
             section_table.add_column("Model ID", style="meta.value")
             section_table.add_column("Profile", style="muted", no_wrap=True)
+            section_table.add_column("Reason", no_wrap=True)
             section_table.add_column("Base URL", style="muted")
             section_table.add_column("Checked", style="muted", no_wrap=True)
             section_table.add_column("Active", style="meta.value", no_wrap=True)
@@ -1444,6 +1633,7 @@ class TUI:
                     str(entry.index),
                     entry.model_name,
                     entry.display_name,
+                    self._model_status_text(entry.status),
                     entry.base_url,
                     self._format_checked_at(entry.checked_at),
                     (
@@ -1456,17 +1646,19 @@ class TUI:
 
             model_sections.extend([status_title, section_table, Text()])
 
-        provider_issue_rows: list[tuple[str, str, Text, str]] = []
+        provider_issue_rows: list[tuple[str, str, Text, Text, str]] = []
         for result in catalog_results:
             if result.models:
                 continue
 
             lowered_error = (result.error or "").lower()
             status = "missing-key" if "no api key" in lowered_error else "error"
+            bucket = model_status_bucket(status)
             provider_issue_rows.append(
                 (
                     result.source.display_name,
                     result.source.base_url,
+                    self._model_bucket_text(bucket),
                     self._model_status_text(status),
                     self._format_checked_at(result.checked_at),
                 )
@@ -1476,11 +1668,18 @@ class TUI:
             issues_table = Table(expand=True, box=None, padding=(0, 1))
             issues_table.add_column("Provider", style="meta.value")
             issues_table.add_column("Base URL", style="muted")
-            issues_table.add_column("Status", no_wrap=True)
+            issues_table.add_column("Bucket", no_wrap=True)
+            issues_table.add_column("Reason", no_wrap=True)
             issues_table.add_column("Checked", style="muted", no_wrap=True)
 
-            for provider_name, base_url, status_text, checked_at in provider_issue_rows:
-                issues_table.add_row(provider_name, base_url, status_text, checked_at)
+            for provider_name, base_url, bucket_text, status_text, checked_at in provider_issue_rows:
+                issues_table.add_row(
+                    provider_name,
+                    base_url,
+                    bucket_text,
+                    status_text,
+                    checked_at,
+                )
 
             model_sections.extend(
                 [
@@ -1496,10 +1695,11 @@ class TUI:
         )
 
         summary_parts: list[str] = []
-        for status in MODEL_STATUS_ORDER:
-            count = status_counts.get(status)
+        for bucket in MODEL_BUCKET_ORDER:
+            count = bucket_counts.get(bucket)
             if count:
-                summary_parts.append(f"{count} {status}")
+                label = "not working" if bucket == "not-working" else bucket
+                summary_parts.append(f"{count} {label}")
 
         summary_block = Group(
             self._summary_text(summary_parts)

@@ -12,6 +12,8 @@ from dotenv import dotenv_values, load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORKSPACE = PROJECT_ROOT / "workspace"
 WORKSPACE.mkdir(exist_ok=True)
+INITIAL_ENV = dict(os.environ)
+ACTIVE_WORKSPACE_ENV: dict[str, str] = {}
 
 
 from agent.agent import Agent
@@ -21,6 +23,15 @@ from agent.session import Session
 from config.config import ApprovalPolicy, Config
 from config.loader import load_config
 from ui.tui import TUI, get_console
+from utils.credential_setup import (
+    normalize_base_url,
+    resolve_api_key_env_name,
+    should_prompt_for_base_url,
+    split_config_errors,
+    suggested_base_url,
+    upsert_env_file,
+    validate_base_url,
+)
 from utils.model_discovery import (
     ModelCatalogEntry,
     ModelCatalogResult,
@@ -35,14 +46,36 @@ from utils.model_health import ModelHealthChecker, ModelHealthRecord, ModelHealt
 from utils.workspace_history import WorkspaceHistoryManager
 
 
-def _load_env_file(path: Path | None) -> None:
+def _load_env_file(path: Path | None, *, override: bool = False) -> None:
     if path is None:
         return
-    load_dotenv(path, override=False)
+    load_dotenv(path, override=override)
 
 
-_load_env_file(PROJECT_ROOT / ".env")
-_load_env_file(Path.cwd() / ".env")
+def _read_env_values(path: Path | None) -> dict[str, str]:
+    if path is None or not path.is_file():
+        return {}
+
+    return {
+        key: value
+        for key, value in dotenv_values(path).items()
+        if value is not None
+    }
+
+
+def _activate_workspace_env(cwd: Path) -> None:
+    global ACTIVE_WORKSPACE_ENV
+
+    for key in ACTIVE_WORKSPACE_ENV:
+        original_value = INITIAL_ENV.get(key)
+        if original_value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = original_value
+
+    env_values = _read_env_values(cwd / ".env")
+    os.environ.update(env_values)
+    ACTIVE_WORKSPACE_ENV = env_values
 
 console = get_console()
 
@@ -69,13 +102,17 @@ class CLI:
 
     async def _load_config_for_workspace(self, target: Path) -> Config:
         target = _validate_workspace_directory(target)
-        config = load_config(cwd=target)
-        config.cwd = target
-
-        errors = config.validate()
-        if errors:
-            raise ValueError("\n".join(errors))
-
+        with _temporary_workspace_env(target):
+            config, errors = _load_config_with_errors(target)
+        credential_errors, other_errors = split_config_errors(errors)
+        if other_errors:
+            raise ValueError("\n".join(other_errors))
+        if credential_errors:
+            config = await _prompt_for_missing_api_credentials(
+                requested_cwd=target,
+                config=config,
+                tui=self.tui,
+            )
         return config
 
     async def _switch_workspace(self, target: Path) -> None:
@@ -95,6 +132,7 @@ class CLI:
         auto_model_notice: tuple[str, str] | None = None
         new_session: Session | None = None
         try:
+            _activate_workspace_env(target)
             self.config = new_config
             self.tui.set_config(new_config)
             auto_model_notice = await self._ensure_working_model(reason="Workspace")
@@ -103,6 +141,7 @@ class CLI:
             new_session.approval_manager.confirmation_callback = self.tui.handle_confirmation
             await new_session.initialize()
         except Exception:
+            _activate_workspace_env(previous_config.cwd)
             self.config = previous_config
             self.tui.set_config(previous_config)
             with contextlib.suppress(Exception):
@@ -462,10 +501,39 @@ class CLI:
         health_records[record_key] = record
         return record
 
+    async def _repair_api_credentials(
+        self,
+        *,
+        current_record: ModelHealthRecord,
+    ) -> None:
+        detail = (current_record.detail or "").strip()
+        if current_record.status == "auth-error":
+            prompt_error = (
+                "Current API credentials were rejected by the provider."
+                + (f" {detail}" if detail else "")
+            )
+        elif current_record.status == "missing-key":
+            prompt_error = "No API key is configured for this workspace."
+        else:
+            prompt_error = detail or "Update the API credentials for this workspace."
+
+        self.tui.clear_status()
+        updated_config = await _prompt_for_missing_api_credentials(
+            requested_cwd=self.config.cwd,
+            config=self.config,
+            tui=self.tui,
+            initial_api_key_error=prompt_error,
+        )
+        self.config = updated_config
+        self.tui.set_config(updated_config)
+        self._invalidate_model_catalog()
+        await self._reset_model_client()
+
     async def _ensure_working_model(
         self,
         *,
         reason: str,
+        allow_credential_repair: bool = True,
     ) -> tuple[str, str] | None:
         catalog_results = await self._get_model_catalog(
             refresh=True,
@@ -485,6 +553,13 @@ class CLI:
 
         if current_record and current_record.status == "working":
             return None
+
+        if allow_credential_repair and _should_repair_api_credentials(current_record):
+            await self._repair_api_credentials(current_record=current_record)
+            return await self._ensure_working_model(
+                reason=reason,
+                allow_credential_repair=False,
+            )
 
         selected_entry = select_best_working_model(
             catalog_results,
@@ -1067,39 +1142,127 @@ class CLI:
             )
 
 
-def _load_validated_config(requested_cwd: Path) -> Config:
+def _load_config_with_errors(requested_cwd: Path) -> tuple[Config, list[str]]:
     validated_cwd = _validate_workspace_directory(requested_cwd)
     config = load_config(cwd=validated_cwd)
     config.cwd = validated_cwd
-    errors = config.validate()
+    return config, config.validate()
+
+
+def _load_validated_config(requested_cwd: Path) -> Config:
+    config, errors = _load_config_with_errors(requested_cwd)
     if errors:
         raise ValueError("\n".join(errors))
     return config
 
 
+async def _prompt_for_missing_api_credentials(
+    *,
+    requested_cwd: Path,
+    config: Config,
+    tui: TUI,
+    initial_api_key_error: str | None = None,
+) -> Config:
+    env_path = requested_cwd / ".env"
+    api_key_env_name = resolve_api_key_env_name(config)
+    provider_url = suggested_base_url(config)
+    provider_error: str | None = None
+    api_key_error: str | None = initial_api_key_error
+    docs_path = PROJECT_ROOT / "docs" / "api-keys.md"
+    if not docs_path.is_file():
+        docs_path = None
+    prompt_for_base_url = should_prompt_for_base_url(config)
+
+    while True:
+        if prompt_for_base_url:
+            provider_input = (
+                await tui.prompt_api_provider_url(
+                    workspace_dir=requested_cwd,
+                    default_url=provider_url,
+                    api_key_env_name=api_key_env_name,
+                    docs_path=docs_path,
+                    error_message=provider_error,
+                    info_message=(
+                        "This gets saved into the workspace .env file so future launches reuse it."
+                    ),
+                )
+            ).strip()
+            provider_url = normalize_base_url(provider_input or provider_url)
+            provider_error = validate_base_url(provider_url)
+            if provider_error:
+                continue
+        else:
+            provider_url = suggested_base_url(config)
+
+        api_key = (
+            await tui.prompt_api_key(
+                workspace_dir=requested_cwd,
+                provider_url=provider_url,
+                api_key_env_name=api_key_env_name,
+                docs_path=docs_path,
+                error_message=api_key_error,
+                info_message=(
+                    "Your key is hidden while you type and is saved only in this workspace's .env file."
+                ),
+            )
+        ).strip()
+
+        if not api_key:
+            api_key_error = (
+                f"Enter a non-empty API key for {api_key_env_name} to continue."
+            )
+            continue
+
+        env_updates = {api_key_env_name: api_key}
+        if prompt_for_base_url:
+            env_updates["BASE_URL"] = provider_url
+
+        upsert_env_file(env_path, env_updates)
+        _activate_workspace_env(requested_cwd)
+
+        reloaded_config, errors = _load_config_with_errors(requested_cwd)
+        credential_errors, other_errors = split_config_errors(errors)
+        if other_errors:
+            raise ValueError("\n".join(other_errors))
+        if not credential_errors:
+            return reloaded_config
+
+        api_key_error = credential_errors[0]
+
+
+def _should_repair_api_credentials(record: ModelHealthRecord | None) -> bool:
+    if record is None:
+        return False
+    return record.status in {"missing-key", "auth-error"}
+
+
 @contextlib.contextmanager
 def _temporary_workspace_env(cwd: Path):
     env_path = cwd / ".env"
-    if not env_path.is_file():
+    env_values = _read_env_values(env_path)
+    impacted_keys = set(ACTIVE_WORKSPACE_ENV) | set(env_values)
+    if not impacted_keys:
         yield
         return
 
-    env_values = {
-        key: value
-        for key, value in dotenv_values(env_path).items()
-        if value is not None and key not in os.environ
-    }
+    previous_values = {key: os.environ.get(key) for key in impacted_keys}
 
-    if not env_values:
-        yield
-        return
+    for key in ACTIVE_WORKSPACE_ENV:
+        original_value = INITIAL_ENV.get(key)
+        if original_value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = original_value
 
     os.environ.update(env_values)
     try:
         yield
     finally:
-        for key in env_values:
-            os.environ.pop(key, None)
+        for key, previous_value in previous_values.items():
+            if previous_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous_value
 
 
 def _validate_startup_workspace_choice(candidate: Path) -> str | None:
@@ -1110,9 +1273,13 @@ def _validate_startup_workspace_choice(candidate: Path) -> str | None:
 
     try:
         with _temporary_workspace_env(validated_cwd):
-            _load_validated_config(validated_cwd)
+            _, errors = _load_config_with_errors(validated_cwd)
     except Exception as exc:
         return str(exc)
+
+    _, other_errors = split_config_errors(errors)
+    if other_errors:
+        return "\n".join(other_errors)
 
     return None
 
@@ -1316,8 +1483,20 @@ def main(
             requested_cwd=cwd,
             workspace_history=workspace_history,
         )
-        _load_env_file(requested_cwd / ".env")
-        config = _load_validated_config(requested_cwd)
+        _activate_workspace_env(requested_cwd)
+        config, errors = _load_config_with_errors(requested_cwd)
+        credential_errors, other_errors = split_config_errors(errors)
+        if other_errors:
+            raise ValueError("\n".join(other_errors))
+        if credential_errors:
+            selector_tui = TUI(config, console)
+            config = asyncio.run(
+                _prompt_for_missing_api_credentials(
+                    requested_cwd=requested_cwd,
+                    config=config,
+                    tui=selector_tui,
+                )
+            )
     except Exception as e:
         console.print(f"[error]Configuration Error: {e}[/error]")
         sys.exit(1)

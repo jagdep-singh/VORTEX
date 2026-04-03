@@ -27,6 +27,12 @@ MODEL_STATUS_ORDER = (
     "unknown",
 )
 
+MODEL_BUCKET_ORDER = (
+    "working",
+    "quota",
+    "not-working",
+)
+
 
 @dataclass(frozen=True)
 class ModelCatalogSource:
@@ -59,6 +65,29 @@ class ModelCatalogEntry:
     is_active: bool
     status: str
     note: str | None = None
+
+
+def model_status_bucket(status: str | None) -> str:
+    normalized = (status or "unknown").strip().lower()
+    if normalized == "working":
+        return "working"
+    if normalized in {"quota", "rate-limited"}:
+        return "quota"
+    return "not-working"
+
+
+def group_model_catalog_entries_by_bucket(
+    entries: list[ModelCatalogEntry],
+) -> list[tuple[str, list[ModelCatalogEntry]]]:
+    grouped: dict[str, list[ModelCatalogEntry]] = {}
+    for entry in entries:
+        grouped.setdefault(model_status_bucket(entry.status), []).append(entry)
+
+    return [
+        (bucket, grouped[bucket])
+        for bucket in MODEL_BUCKET_ORDER
+        if bucket in grouped
+    ]
 
 
 class ModelCatalogStore:

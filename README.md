@@ -156,6 +156,34 @@ BASE_URL=https://api.openai.com/v1
 
 You can place these in a local `.env` file. If you store secrets in `.env`, keep that file out of version control.
 
+On startup, if the selected workspace does not yet have a resolved API key, VORTEX now opens a guided setup flow and asks for:
+
+- the provider URL
+- the API key to save for that workspace
+
+Those values are written into that workspace's `.env` file so the next launch can reuse them.
+
+## Getting Your Own API Key
+
+VORTEX expects an OpenAI-compatible provider URL plus an API key.
+
+Common provider URLs:
+
+```text
+https://api.openai.com/v1
+https://openrouter.ai/api/v1
+http://localhost:11434/v1
+```
+
+Quick guide:
+
+1. Pick a provider such as OpenAI, OpenRouter, or a local OpenAI-compatible gateway.
+2. Create an API key from that provider's dashboard or account settings.
+3. Use the provider's API base URL ending in `/v1`.
+4. Paste both values into the VORTEX startup prompt.
+
+There is a longer walkthrough in [`docs/api-keys.md`](./docs/api-keys.md).
+
 ## Docker
 
 This repo now includes:
