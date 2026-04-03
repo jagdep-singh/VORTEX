@@ -488,3 +488,10 @@ A few practical things to know:
 3. Run `vortex`.
 4. Type a request at the `╰─ you ›` prompt.
 5. Use `/help` if you want to inspect commands from inside the app.
+
+
+
+
+
+im a noob at this and this is my first pipx thing so im still learning .... so cut me slack and if u have any feedbacks or things u need to be changed, fixed or new features do reach out via github and other souces 
+thats it and thankyou
