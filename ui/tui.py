@@ -16,6 +16,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.rule import Rule
+from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -70,7 +71,10 @@ AGENT_THEME = Theme(
         "assistant": "#c9c9c9",
         "assistant.badge": "#00e5e5",
         "assistant.inline_code": "bold #00e5e5",
-        "assistant.code_block": "#c9c9c9 on #121212",
+        "assistant.code_block": "#d6f5ff",
+        "assistant.panel.border": "#2c6476",
+        "assistant.panel.title": "bold #e7fbff",
+        "assistant.panel.subtitle": "#7fc9d8",
         "thinking": "italic #777777",
         "thinking.badge": "#00e5e5",
         "meta.label": "#00e5e5",
@@ -105,6 +109,26 @@ class TUI:
     _PROMPT_MARKER = "╰─"
     _WORKSPACE_PROMPT_LABEL = "workspace"
     _STATUS_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    _ASSISTANT_AURORA = (
+        "#102636",
+        "#153244",
+        "#1a3e52",
+        "#1f4a60",
+        "#25566d",
+        "#2c627b",
+    )
+    _ASSISTANT_INLINE_AURORA = (
+        "#1e3944",
+        "#244552",
+        "#2b5260",
+        "#325f70",
+    )
+    _ASSISTANT_CODE_AURORA = (
+        "#11181f",
+        "#152029",
+        "#192733",
+        "#1d2f3c",
+    )
     _LOGO = "\n".join(
         [
             "                                                   ",
@@ -128,9 +152,9 @@ class TUI:
         self.config = config
         self.cwd = self.config.cwd
         self._assistant_stream_open = False
-        self._assistant_mode = "text"
-        self._assistant_pending_backticks = ""
-        self._assistant_fence_header_pending = False
+        self._assistant_buffer = ""
+        self._assistant_animation_phase = 0
+        self._assistant_live: Live | None = None
         self._tool_args_by_call_id: dict[str, dict[str, Any]] = {}
         self._max_block_tokens = 2500
         self._last_status: str | None = None
