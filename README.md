@@ -84,7 +84,7 @@ Add `--cwd /workspace/subdir` if you want a different project inside the contain
 - Version is in `pyproject.toml`.
 - CI builds/tests/publishes via `.github/workflows/publish-pypi.yml`.
 - Create a GitHub release after bumping the version to publish to PyPI.
-- Current version: 0.1.1.
+- Current version: 1.0.0.
 
 ## Progress log (local)
 - Working notes for handoff live in `progress_report.txt` (ignored by git).
