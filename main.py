@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import shlex
 
 import click
 from dotenv import dotenv_values, load_dotenv
@@ -21,6 +22,7 @@ from agent.agent import Agent
 from agent.events import AgentEventType
 from agent.persistence import PersistenceManager, SessionSnapshot
 from agent.session import Session
+from client.response import TokenUsage
 from config.config import ApprovalPolicy, Config
 from config.loader import load_config
 from ui.tui import TUI, get_console
@@ -164,6 +166,8 @@ class CLI:
         previous_config = self.config
         auto_model_notice: tuple[str, str] | None = None
         new_session: Session | None = None
+        previous_env = dict(ACTIVE_WORKSPACE_ENV)
+        new_env_values = _read_env_values(target / ".env")
         try:
             _activate_workspace_env(target)
             self.config = new_config
@@ -191,6 +195,8 @@ class CLI:
         self.tui.set_config(new_config)
         self.workspace_history.record(new_config.cwd)
         self._invalidate_model_catalog()
+
+        self.tui.show_env_change(previous_env, new_env_values)
 
         if old_session:
             with contextlib.suppress(Exception):
@@ -768,6 +774,10 @@ class CLI:
                                 break
                             continue
 
+                        if user_input.strip() in {"?", "/?"}:
+                            self.tui.show_key_help()
+                            continue
+
                         self._active_message_task = asyncio.create_task(
                             self._process_message(user_input)
                         )
@@ -807,10 +817,13 @@ class CLI:
         assistant_streaming = False
         final_response: str | None = None
         status_animation_task = asyncio.create_task(self._animate_status())
+        start_time = time.monotonic()
+        self.tui.reset_run_metrics()
 
         try:
             async for event in self.agent.run(message):
                 if event.type == AgentEventType.AGENT_START:
+                    self.tui.clear_error()
                     self.tui.show_status("Thinking: understanding your request...")
                 elif event.type == AgentEventType.STATUS:
                     thinking_message = event.data.get("message")
@@ -828,10 +841,11 @@ class CLI:
                     if assistant_streaming:
                         self.tui.end_assistant()
                         assistant_streaming = False
-                    self.tui.clear_status()
+                        self.tui.clear_status()
                 elif event.type == AgentEventType.AGENT_ERROR:
                     error = _clean_error_message(event.data.get("error", "Unknown error"))
                     self.tui.clear_status()
+                    self.tui.record_error(error)
                     self.tui.show_notice(f"Error: {error}", level="error")
                     lower_error = str(error).lower()
                     if "invalid argument" in lower_error or "code: 400" in lower_error:
@@ -839,6 +853,17 @@ class CLI:
                             "The model rejected the request (invalid argument). Try /models refresh or /api-change, then rerun the task.",
                             level="warning",
                         )
+                elif event.type == AgentEventType.AGENT_END:
+                    usage_data = event.data.get("usage")
+                    usage = None
+                    if isinstance(usage_data, dict):
+                        try:
+                            usage = TokenUsage(**usage_data)
+                        except Exception:
+                            usage = None
+                    elapsed = time.monotonic() - start_time
+                    self.tui.set_run_metrics(elapsed, usage)
+                    self.tui.show_status("Ready")
                 elif event.type == AgentEventType.TOOL_CALL_START:
                     tool_name = event.data.get("name", "unknown")
                     tool_kind = self._get_tool_kind(tool_name)
@@ -898,6 +923,8 @@ class CLI:
             return False
         elif cmd_name_lower == "/help":
             self.tui.show_help()
+        elif cmd_name_lower in {"/?", "?"}:
+            self.tui.show_key_help()
         elif cmd_name_lower == "/clear":
             self.agent.session.context_manager.clear()
             self.agent.session.loop_detector.clear()
@@ -1115,8 +1142,66 @@ class CLI:
             tools = self.agent.session.tool_registry.get_tools()
             self.tui.show_tools(tools)
         elif cmd_name_lower == "/mcp":
+            sub = cmd_args.strip()
+            if sub.startswith("attach"):
+                parts = sub.split(maxsplit=2)
+                if len(parts) < 3:
+                    self.tui.show_notice(
+                        "Usage: /mcp attach <name> <url|command...>",
+                        level="error",
+                    )
+                    return True
+                name = parts[1]
+                target = parts[2].strip()
+                server_config = None
+                if "://" in target:
+                    server_config = MCPServerConfig(url=target)
+                else:
+                    tokens = shlex.split(target)
+                    if not tokens:
+                        self.tui.show_notice(
+                            "Provide a command to launch the MCP server.",
+                            level="error",
+                        )
+                        return True
+                    server_config = MCPServerConfig(
+                        command=tokens[0],
+                        args=tokens[1:],
+                    )
+
+                try:
+                    added = await self.agent.session.mcp_manager.add_server(
+                        name,
+                        server_config,
+                        self.agent.session.tool_registry,
+                    )
+                    self.tui.show_notice(
+                        f"Connected MCP '{name}' with {added} tool(s).",
+                        level="success",
+                    )
+                except Exception as exc:
+                    self.tui.show_notice(
+                        f"Failed to attach MCP '{name}': {exc}",
+                        level="error",
+                    )
+                return True
+
             mcp_servers = self.agent.session.mcp_manager.get_all_servers()
             self.tui.show_mcp_servers(mcp_servers)
+        elif cmd_name_lower == "/contrast":
+            mode = cmd_args.strip().lower()
+            if mode in {"on", "enable", "true", "yes", "1"}:
+                enabled = True
+            elif mode in {"off", "disable", "false", "no", "0"}:
+                enabled = False
+            else:
+                enabled = not getattr(self.tui, "_high_contrast", False)
+
+            self.tui.set_high_contrast(enabled)
+            self.tui.show_notice(
+                f"High-contrast theme {'enabled' if enabled else 'disabled'}.",
+                level="success",
+            )
         elif cmd_name_lower == "/save":
             persistence_manager = PersistenceManager()
             session_snapshot = SessionSnapshot(
@@ -1682,6 +1767,7 @@ def main(
     workspace_history = WorkspaceHistoryManager()
 
     try:
+        previous_env = dict(ACTIVE_WORKSPACE_ENV)
         requested_cwd = _choose_startup_workspace(
             prompt=prompt,
             requested_cwd=cwd,
@@ -1707,6 +1793,11 @@ def main(
 
     workspace_history.record(requested_cwd)
     cli = CLI(config, workspace_history=workspace_history)
+    try:
+        new_env_values = dict(ACTIVE_WORKSPACE_ENV)
+        cli.tui.show_env_change(previous_env, new_env_values)
+    except Exception:
+        pass
 
     # messages = [{"role": "user", "content": prompt}]
     if prompt:

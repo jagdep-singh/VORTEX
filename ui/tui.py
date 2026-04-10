@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -22,8 +23,11 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
+from client.response import TokenUsage
+
 from config.config import Config
 from tools.base import ToolConfirmation
+from utils.credential_setup import upsert_env_file
 from utils.model_discovery import (
     MODEL_BUCKET_ORDER,
     ModelCatalogResult,
@@ -48,8 +52,14 @@ except Exception:
     FormattedText = None
     InMemoryHistory = None
 
-AGENT_THEME = Theme(
-    {
+def _truthy_env(value: str | None) -> bool:
+    if not value:
+        return False
+    return value.lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _build_theme(*, high_contrast: bool = False) -> Theme:
+    base = {
         "info": "#00e5e5",
         "warning": "#ffd166",
         "error": "bold #ff6b6b",
@@ -94,15 +104,60 @@ AGENT_THEME = Theme(
         "status.error.badge": "#ff6b6b",
         "code": "#c9c9c9",
     }
-)
+
+    if high_contrast:
+        base.update(
+            {
+                "muted": "#bfbfbf",
+                "dim": "#4d4d4d",
+                "panel.border": "#3a3a3a",
+                "panel.title": "bold #7ef7f7",
+                "panel.subtitle": "#8a8a8a",
+                "assistant": "#f0f0f0",
+                "assistant.panel.border": "#4fb3c2",
+                "assistant.panel.title": "bold #e7ffff",
+                "assistant.panel.subtitle": "#a1d9e4",
+                "meta.value": "#e0e0e0",
+                "tool": "bold #7ef7f7",
+                "code": "#ededed",
+            }
+        )
+
+    return Theme(base)
+
+
+AGENT_THEME = _build_theme(high_contrast=False)
+HIGH_CONTRAST_THEME = _build_theme(high_contrast=True)
 
 _console: Console | None = None
+_console_high_contrast = False
+
+
+def _is_high_contrast_enabled() -> bool:
+    return _truthy_env(os.environ.get("VORTEX_HIGH_CONTRAST"))
 
 
 def get_console() -> Console:
     global _console
+    global _console_high_contrast
+    requested_contrast = _is_high_contrast_enabled()
     if _console is None:
-        _console = Console(theme=AGENT_THEME, highlight=False)
+        _console = Console(
+            theme=HIGH_CONTRAST_THEME if requested_contrast else AGENT_THEME,
+            highlight=False,
+        )
+        _console_high_contrast = requested_contrast
+    else:
+        if _console_high_contrast != requested_contrast:
+            _console_high_contrast = requested_contrast
+            try:
+                _console.push_theme(
+                    HIGH_CONTRAST_THEME if requested_contrast else AGENT_THEME
+                )
+            except Exception:
+                _console.theme = (
+                    HIGH_CONTRAST_THEME if requested_contrast else AGENT_THEME
+                )
     return _console
 
 
@@ -112,22 +167,21 @@ class TUI:
     _STATUS_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
     _WORKSPACE_ART = "\n".join(
         [
-            "__        __         _                                  ",
-            "\\ \\      / /__  _ __| | _____ _ __   __ _  ___ ___     ",
-            " \\ \\ /\\ / / _ \\| '__| |/ / __| '_ \\ / _` |/ __/ _ \\ ",
-            "  \\ V  V / (_) | |  |   <\\__ \\ |_) | (_| | (_|  __/ ",
-            "   \\_/\\_/ \\___/|_|  |_|\\_\\___/ .__/ \\__,_|\\___\\___|",
-            "                             |_|                      ",
+            "▗▖ ▗▖ ▗▄▖ ▗▄▄▖ ▗▖ ▗▖ ▗▄▄▖▗▄▄▖  ▗▄▖  ▗▄▄▖▗▄▄▄▖",
+            "▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▐▌▗▞▘▐▌   ▐▌ ▐▌▐▌ ▐▌▐▌   ▐▌   ",
+            "▐▌ ▐▌▐▌ ▐▌▐▛▀▚▖▐▛▚▖  ▝▀▚▖▐▛▀▘ ▐▛▀▜▌▐▌   ▐▛▀▀▘",
+            "▐▙█▟▌▝▚▄▞▘▐▌ ▐▌▐▌ ▐▌▗▄▄▞▘▐▌   ▐▌ ▐▌▝▚▄▄▖▐▙▄▄▖",
+            "                                             ",
+            
         ]
     )
     _API_ART = "\n".join(
         [
-            "    ___    ____  ____     _____      __                ",
-            "   /   |  / __ \\/  _/    / ___/___  / /___  ______     ",
-            "  / /| | / /_/ // /      \\__ \\/ _ \\/ __/ / / / __ \\ ",
-            " / ___ |/ ____// /      ___/ /  __/ /_/ /_/ / /_/ /    ",
-            "/_/  |_/_/   /___/     /____/\\___/\\__/\\__,_/ .___/ ",
-            "                                          /_/          ",
+            " ▗▄▖ ▗▄▄▖▗▄▄▄▖     ▗▄▄▖▗▄▄▄▖▗▄▄▄▖▗▖ ▗▖▗▄▄▖ ",
+            "▐▌ ▐▌▐▌ ▐▌ █      ▐▌   ▐▌     █  ▐▌ ▐▌▐▌ ▐▌",
+            "▐▛▀▜▌▐▛▀▘  █       ▝▀▚▖▐▛▀▀▘  █  ▐▌ ▐▌▐▛▀▘ ",
+            "▐▌ ▐▌▐▌  ▗▄█▄▖    ▗▄▄▞▘▐▙▄▄▖  █  ▝▚▄▞▘▐▌   ",
+            "                                           ",
         ]
     )
     _LOGO = "\n".join(
@@ -165,6 +219,12 @@ class TUI:
         self._status_live: Live | None = None
         self._supports_live_status = sys.stdout.isatty()
         self._status_suspended = False
+        self._last_status_signature: tuple[Any, ...] | None = None
+        self._last_error: str | None = None
+        self._last_run_elapsed: float | None = None
+        self._last_run_usage: TokenUsage | None = None
+        self._prompt_notice_shown = False
+        self._high_contrast = _is_high_contrast_enabled()
         self._prompt_session = None
         requested_prompt_toolkit = os.environ.get("VORTEX_USE_PROMPT_TOOLKIT", "")
         self._use_prompt_toolkit = requested_prompt_toolkit.lower() in {
@@ -187,17 +247,74 @@ class TUI:
             self._prompt_session = PromptSession(
                 history=InMemoryHistory(),
             )
+        else:
+            self._maybe_warn_prompt_toolkit()
+
+        self._apply_theme()
 
     def set_config(self, config: Config) -> None:
         self.config = config
         self.cwd = config.cwd
 
+    def _apply_theme(self) -> None:
+        theme = HIGH_CONTRAST_THEME if self._high_contrast else AGENT_THEME
+        try:
+            self.console.push_theme(theme)
+        except Exception:
+            try:
+                self.console.theme = theme
+            except Exception:
+                pass
+
+    def _maybe_warn_prompt_toolkit(self) -> None:
+        if self._prompt_notice_shown:
+            return
+        if not self._use_prompt_toolkit:
+            return
+        if self._prompt_session is not None:
+            return
+
+        reason = "prompt_toolkit unavailable"
+        if PromptSession is not None and InMemoryHistory is not None:
+            if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                reason = "non-interactive terminal"
+            else:
+                reason = "prompt_toolkit disabled"
+
+        self.console.print(
+            Text(
+                f"Path completion/history disabled ({reason}); using basic input.",
+                style="warning",
+            )
+        )
+        self._prompt_notice_shown = True
+
     def _pause_live_status(self) -> None:
         if self._status_live is not None:
-            self._status_live.stop()
+            try:
+                self._status_live.stop()
+            except Exception:
+                pass
             self._status_live = None
 
+    def _stop_assistant_live(self, *, keep_output: bool) -> None:
+        if self._assistant_live is not None:
+            try:
+                self._assistant_live.stop()
+            except Exception:
+                pass
+            self._assistant_live = None
+
+        if keep_output and self._assistant_stream_open:
+            self.console.print(self._render_assistant_panel(streaming=False))
+            self.console.print()
+
+        self._assistant_stream_open = False
+        self._assistant_buffer = ""
+        self._assistant_animation_phase = 0
+
     def clear_screen(self) -> None:
+        self._stop_assistant_live(keep_output=False)
         self._pause_live_status()
         self.console.clear(home=True)
 
@@ -818,6 +935,14 @@ class TUI:
                         "muted",
                     ),
                     (" · LOCAL AGENT · LIVE TOOLS", "muted"),
+                    (
+                        f" · workspace {Path(self.config.cwd).name}",
+                        "muted",
+                    ),
+                    (
+                        f" · profile {self.config.active_model_profile or 'default'}",
+                        "muted",
+                    ),
                 ),
                 style="panel.border",
             )
@@ -886,15 +1011,7 @@ class TUI:
         self._assistant_live.start()
 
     def end_assistant(self) -> None:
-        if self._assistant_live is not None:
-            self._assistant_live.stop()
-            self._assistant_live = None
-        if self._assistant_stream_open:
-            self.console.print(self._render_assistant_panel(streaming=False))
-            self.console.print()
-        self._assistant_stream_open = False
-        self._assistant_buffer = ""
-        self._assistant_animation_phase = 0
+        self._stop_assistant_live(keep_output=True)
 
     def _assistant_text_style_for_mode(self, mode: str) -> str:
         if mode == "inline_code":
@@ -1023,6 +1140,25 @@ class TUI:
                 refresh=True,
             )
 
+    def clear_error(self) -> None:
+        self._last_error = None
+
+    def record_error(self, message: str | None) -> None:
+        if not message:
+            return
+        self._last_error = self._short_text(str(message), limit=120)
+
+    def reset_run_metrics(self) -> None:
+        self._last_run_elapsed = None
+        self._last_run_usage = None
+
+    def set_run_metrics(self, elapsed_seconds: float | None, usage: TokenUsage | None) -> None:
+        self._last_run_elapsed = elapsed_seconds
+        self._last_run_usage = usage
+
+    def _format_tokens(self, value: int) -> str:
+        return f"{value:,}"
+
     def show_status(self, message: str) -> None:
         if self._status_suspended:
             return
@@ -1035,11 +1171,25 @@ class TUI:
                 label = prefix.strip()
                 detail = suffix.strip() or prefix.strip()
 
-        changed = (
-            message != self._last_status
-            or label.lower() != self._status_label
-            or detail != self._status_detail
+        signature = (
+            label.lower(),
+            detail,
+            round(self._last_run_elapsed or 0.0, 1) if self._last_run_elapsed else None,
+            (
+                (self._last_run_usage.total_tokens)
+                if self._last_run_usage
+                else None
+            ),
+            (
+                self._last_run_usage.cached_tokens
+                if self._last_run_usage
+                else None
+            ),
+            self._last_error,
         )
+
+        changed = signature != self._last_status_signature
+        self._last_status_signature = signature
         self._last_status = message
         self._status_label = label.lower()
         self._status_detail = detail
@@ -1061,11 +1211,9 @@ class TUI:
             self._refresh_status_line()
             return
 
-        if not changed:
-            return
-
-        self.console.print()
-        self.console.print(self._render_status_line())
+        if changed:
+            self.console.print()
+            self.console.print(self._render_status_line())
 
     def advance_status_frame(self) -> None:
         if (
@@ -1095,6 +1243,31 @@ class TUI:
         line.append(f"{self._status_label.upper()} ", style="meta.label")
         line.append("· ", style="muted")
         line.append(self._status_detail, style="thinking")
+
+        if self._last_run_elapsed is not None:
+            line.append(" · ", style="muted")
+            line.append(f"{self._last_run_elapsed:.1f}s", style="meta.value")
+
+        if self._last_run_usage:
+            tokens = self._last_run_usage.total_tokens or (
+                self._last_run_usage.prompt_tokens
+                + self._last_run_usage.completion_tokens
+            )
+            token_parts = [f"tok {self._format_tokens(tokens)}"]
+            if self._last_run_usage.cached_tokens:
+                token_parts.append(
+                    f"cached {self._format_tokens(self._last_run_usage.cached_tokens)}"
+                )
+            line.append(" · ", style="muted")
+            line.append(" ".join(token_parts), style="meta.value")
+        elif self._last_run_elapsed is not None:
+            line.append(" · ", style="muted")
+            line.append("tok n/a", style="muted")
+
+        if self._last_error:
+            line.append(" · ", style="muted")
+            line.append("ERR ", style="status.error.badge")
+            line.append(self._last_error, style="error")
         return line
 
     def _refresh_status_line(self) -> None:
@@ -1320,6 +1493,9 @@ class TUI:
         border_style = f"tool.{tool_kind}" if tool_kind else "tool"
         state = "done" if success else "failed"
         state_style = "status.success.badge" if success else "status.error.badge"
+
+        if not success:
+            self.record_error(error or output or f"{name} failed")
 
         args = self._tool_args_by_call_id.get(call_id, {})
         blocks: list[Any] = []
@@ -1553,6 +1729,13 @@ class TUI:
             )
         )
 
+
+    """
+        if u are this deep into this repo first of all thankyou for looking at my work and secondly i'm sorry for the state of this code, 
+        it is very much a first draft and i expect to refactor it heavily as i continue development. 
+        that being said, if you have any suggestions or want to contribute please feel free to open an issue or a pull request!
+    """
+
     def handle_confirmation(self, confirmation: ToolConfirmation) -> bool:
         self.suspend_status()
 
@@ -1603,6 +1786,81 @@ class TUI:
             return response.lower() in {"y", "yes"}
         finally:
             self.resume_status()
+
+    def show_env_change(
+        self,
+        previous: dict[str, str] | None,
+        new: dict[str, str] | None,
+    ) -> None:
+        prev = previous or {}
+        new_values = new or {}
+
+        added = sorted(set(new_values) - set(prev))
+        removed = sorted(set(prev) - set(new_values))
+        changed = sorted(
+            key
+            for key in new_values
+            if key in prev and new_values.get(key) != prev.get(key)
+        )
+
+        summary = []
+        if added:
+            summary.append(f"{len(added)} added")
+        if changed:
+            summary.append(f"{len(changed)} updated")
+        if removed:
+            summary.append(f"{len(removed)} removed")
+
+        table = Table(expand=True, box=None, padding=(0, 1))
+        table.add_column("Change", style="meta.label", no_wrap=True)
+        table.add_column("Key", style="meta.value")
+
+        def add_rows(keys: list[str], label: str):
+            for key in keys[:12]:
+                table.add_row(label, key)
+            if len(keys) > 12:
+                table.add_row(label, f"… {len(keys) - 12} more")
+
+        add_rows(added, "added")
+        add_rows(changed, "updated")
+        add_rows(removed, "removed")
+
+        body: Any
+        if not summary:
+            body = Text("No .env changes for this workspace.", style="muted")
+        else:
+            body = Group(
+                self._summary_text(summary),
+                Text("Keys only; values are hidden for safety.", style="muted"),
+                table,
+            )
+
+        self.console.print()
+        self.console.print(
+            self._panel(
+                body,
+                title=Text.assemble(
+                    self._badge("Env", "status.info.badge"),
+                    (" Workspace .env delta", "panel.title"),
+                ),
+                subtitle=Text(self._home_relative(self.config.cwd), style="panel.subtitle"),
+            )
+        )
+
+    def set_high_contrast(self, enabled: bool, *, persist: bool = True) -> None:
+        if self._high_contrast == enabled:
+            return
+        self._high_contrast = enabled
+        self._apply_theme()
+        if persist:
+            try:
+                upsert_env_file(
+                    self.config.cwd / ".env",
+                    {"VORTEX_HIGH_CONTRAST": "1" if enabled else "0"},
+                )
+            except Exception:
+                # Avoid breaking the session if writing fails
+                pass
 
     def show_config(self) -> None:
         base_url = self.config.base_url or "default"
@@ -1979,6 +2237,29 @@ class TUI:
             )
         )
 
+    def show_key_help(self) -> None:
+        table = Table(expand=True, box=None, padding=(0, 1))
+        table.add_column("Key / Command", style="meta.value", no_wrap=True)
+        table.add_column("Action", style="muted")
+        table.add_row("Enter", "Send the prompt to the agent")
+        table.add_row("Ctrl+C", "Stop the current run; press again to quit")
+        table.add_row("/clear", "Reset conversation and loop detector")
+        table.add_row("/cwd", "Switch workspace and reload tools/context")
+        table.add_row("?", "Show this keyboard cheat sheet")
+        table.add_row("/help", "Full command reference")
+
+        self.console.print()
+        self.console.print(
+            self._panel(
+                table,
+                title=Text.assemble(
+                    self._badge("Keys", "status.info.badge"),
+                    (" Shortcuts", "panel.title"),
+                ),
+                subtitle=Text("navigation", style="panel.subtitle"),
+            )
+        )
+
     def show_help(self) -> None:
         commands = Table(expand=True, box=None, padding=(0, 1))
         commands.add_column("Command", style="meta.value", no_wrap=True)
@@ -1999,11 +2280,14 @@ class TUI:
         commands.add_row(Text("/stats"), "Show session statistics")
         commands.add_row(Text("/tools"), "List available tools")
         commands.add_row(Text("/mcp"), "Show MCP server status")
+        commands.add_row(Text("/mcp attach <name> <url|command>"), "Attach an MCP server at runtime")
+        commands.add_row(Text("/contrast [on|off|toggle]"), "Switch between standard and high-contrast themes")
         commands.add_row(Text("/save"), "Save the current session")
         commands.add_row(Text("/checkpoint [name]"), "Create a checkpoint")
         commands.add_row(Text("/sessions"), "List saved sessions")
         commands.add_row(Text("/resume <session_id>"), "Resume a saved session")
         commands.add_row(Text("/restore <checkpoint_id>"), "Restore a checkpoint")
+        commands.add_row(Text("? or /?"), "Show keyboard shortcuts")
 
         tips = self._panel(
             Group(

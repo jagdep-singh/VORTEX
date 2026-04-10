@@ -1,6 +1,6 @@
 import asyncio
 from typing import Any
-from config.config import Config
+from config.config import Config, MCPServerConfig
 from tools.mcp.client import MCPClient, MCPServerStatus
 from tools.mcp.mcp_tool import MCPTool
 from tools.registry import ToolRegistry
@@ -61,6 +61,43 @@ class MCPManager:
                 count += 1
 
         return count
+
+    async def add_server(
+        self,
+        name: str,
+        server_config: MCPServerConfig,
+        registry: ToolRegistry,
+    ) -> int:
+        """Dynamically add and connect an MCP server at runtime."""
+        if name in self._clients:
+            await self._clients[name].disconnect()
+
+        client = MCPClient(
+            name=name,
+            config=server_config,
+            cwd=self.config.cwd,
+        )
+        self._clients[name] = client
+
+        await asyncio.wait_for(
+            client.connect(),
+            timeout=server_config.startup_timeout_sec,
+        )
+
+        connected_tools = 0
+        if client.status == MCPServerStatus.CONNECTED:
+            for tool_info in client.tools:
+                registry.register_mcp_tool(
+                    MCPTool(
+                        tool_info=tool_info,
+                        client=client,
+                        config=self.config,
+                        name=f"{client.name}__{tool_info.name}",
+                    )
+                )
+                connected_tools += 1
+
+        return connected_tools
 
     async def shutdown(self) -> None:
         disconnection_tasks = [client.disconnect() for client in self._clients.values()]

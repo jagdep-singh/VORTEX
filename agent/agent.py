@@ -34,7 +34,11 @@ class Agent:
                 final_response = event.data.get("content")
 
         await self.session.hook_system.trigger_after_agent(message, final_response)
-        yield AgentEvent.agent_end(final_response)
+        usage = None
+        if self.session and self.session.context_manager:
+            usage = self.session.context_manager.latest_usage
+
+        yield AgentEvent.agent_end(final_response, usage)
 
     async def _agentic_loop(self) -> AsyncGenerator[AgentEvent, None]:
         max_turns = self.config.max_turns

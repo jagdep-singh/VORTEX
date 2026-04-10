@@ -13,6 +13,7 @@ VORTEX is an art-forward terminal AI pair‑programmer: OpenAI‑compatible brai
 - Best: `pipx install vortex-agent-cli`
 - Local checkout: `python3 -m pip install . --no-build-isolation`
 - One-shot dev env: `./scripts/install.sh`
+- Optional for MCP servers: `python3 -m pip install fastmcp`
 
 ## Update
 - Standard install: `vortex --update`
@@ -61,7 +62,13 @@ max_output_tokens = 8192
 - `/scan` and `/index` – refresh workspace snapshot and symbol index.
 - `/save`, `/sessions`, `/resume`, `/checkpoint`, `/restore` – persistence.
 - `/tools`, `/mcp` – inspect tools and MCP servers.
+- `/mcp attach <name> <url|command>` – connect an MCP server at runtime (SSE via URL, or stdio via command + args).
 - `/help` – full reference.
+
+## MCP servers
+- Declare static servers in `.ai-agent/config.toml` under `[mcp_servers.<name>]` with either `command/args` (stdio) or `url` (SSE).
+- Attach on the fly with `/mcp attach demo http://localhost:3000/mcp` or `/mcp attach ollama ollama serve`.
+- Requires the `fastmcp` Python package (install once per environment). Tools are registered as `server__toolname` inside the agent.
 
 ## Docker (optional)
 ```bash

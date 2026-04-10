@@ -138,6 +138,10 @@ class ContextManager:
 
         return current_tokens > (context_limit * 0.8)
 
+    @property
+    def latest_usage(self) -> TokenUsage:
+        return self._latest_usage
+
     def set_latest_usage(self, usage: TokenUsage):
         self._latest_usage = usage
 
