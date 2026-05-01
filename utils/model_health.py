@@ -12,6 +12,7 @@ from typing import Awaitable, Callable
 from openai import APIConnectionError, APIError, AsyncOpenAI, RateLimitError
 
 from config.loader import get_data_dir
+from utils.provider_auth import resolve_client_api_key
 
 
 @dataclass
@@ -173,7 +174,8 @@ class ModelHealthChecker:
         if not models:
             return []
 
-        if not self.api_key:
+        client_api_key = resolve_client_api_key(self.api_key, self.base_url)
+        if not client_api_key:
             records = [
                 ModelHealthRecord.create(
                     provider=self.provider,
@@ -187,7 +189,7 @@ class ModelHealthChecker:
             return records
 
         client = AsyncOpenAI(
-            api_key=self.api_key,
+            api_key=client_api_key,
             base_url=self.base_url,
             timeout=self.timeout_sec,
             max_retries=0,
@@ -226,7 +228,8 @@ class ModelHealthChecker:
             self.store.save_record(record)
             return record
 
-        if not self.api_key:
+        client_api_key = resolve_client_api_key(self.api_key, self.base_url)
+        if not client_api_key:
             record = ModelHealthRecord.create(
                 provider=self.provider,
                 model=model,
@@ -237,7 +240,7 @@ class ModelHealthChecker:
             return record
 
         client = AsyncOpenAI(
-            api_key=self.api_key,
+            api_key=client_api_key,
             base_url=self.base_url,
             timeout=self.timeout_sec,
             max_retries=0,

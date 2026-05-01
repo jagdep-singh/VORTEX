@@ -1,5 +1,4 @@
 from __future__ import annotations
-import json
 from typing import AsyncGenerator, Callable
 from agent.events import AgentEvent, AgentEventType
 from agent.session import Session
@@ -89,21 +88,7 @@ class Agent:
 
             self.session.context_manager.add_assistant_message(
                 response_text or None,
-                (
-                    [
-                        {
-                            "id": tc.call_id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
-                        for tc in tool_calls
-                    ]
-                    if tool_calls
-                    else None
-                ),
+                ([tc.to_openai_dict() for tc in tool_calls] if tool_calls else None),
             )
 
             if response_text:
@@ -164,11 +149,13 @@ class Agent:
                 tool_result_message = ToolResultMessage(
                     tool_call_id=tool_call.call_id,
                     content=result.to_model_output(),
+                    name=tool_call.name,
                     is_error=not result.success,
                 )
                 self.session.context_manager.add_tool_result(
                     tool_result_message.tool_call_id,
                     tool_result_message.content,
+                    name=tool_result_message.name,
                 )
 
             yield AgentEvent.status("Thinking: reviewing tool output...")

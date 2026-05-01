@@ -40,7 +40,7 @@ temperature = 0
 max_output_tokens = 8192
 ```
 
-First run will prompt for provider URL and API key and store them in your workspace `.env`. Use `/config` anytime to see the resolved profile, base URL, key source, and model.
+First run can now offer a local-or-external setup choice. For a local Ollama path, VORTEX can guide the workspace through a small starter model setup on macOS, Linux, and Windows: it checks whether Ollama is installed and running, can optionally launch Ollama's official installer with your permission, checks local disk space, offers to pull the selected model, and saves the local base URL plus model choice into the workspace `.env`. If you choose an external provider instead, it will prompt for the provider URL and API key and store them in the same workspace `.env`. Use `/config` anytime to see the resolved profile, base URL, key source, and model.
 
 Gemini via Google’s OpenAI-compatible endpoint:
 ```toml
@@ -52,7 +52,25 @@ api_key_env = "GEMINI_API_KEY"
 name = "gemini-2.0-flash"
 temperature = 0.2
 max_output_tokens = 8192
+
+[models.gemini.gemini]
+reasoning_effort = "low"
+cached_content = "cachedContents/abc123"
+
+[models.gemini.gemini.thinking_config]
+include_thoughts = true
+# Use only one of these:
+# thinking_level = "medium"
+# thinking_budget = 8192
 ```
+
+Small local Ollama recommendations:
+- `qwen2.5-coder:1.5b` is the better low-storage default. It is smaller, starts faster, and is the safer pick for laptops that are tight on RAM or disk.
+- `qwen2.5-coder:3b` is the better quality local option if you can spare more space. It is slower and heavier, but usually gives more reliable coding and editing output.
+- Suggested default chooser copy:
+  - `Fast + light`: `qwen2.5-coder:1.5b`
+  - `Better coding quality`: `qwen2.5-coder:3b`
+  - `Use external API instead`
 
 ## Core commands
 - `/models [refresh]` – list or probe models for all profiles.

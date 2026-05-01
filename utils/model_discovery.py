@@ -12,6 +12,7 @@ from openai import APIConnectionError, APIError, AsyncOpenAI, RateLimitError
 from config.config import Config
 from config.loader import get_data_dir
 from utils.model_health import ModelHealthRecord
+from utils.provider_auth import resolve_client_api_key
 
 
 MODEL_STATUS_ORDER = (
@@ -340,7 +341,8 @@ def _format_error(exc: Exception) -> str:
 async def discover_models_for_source(source: ModelCatalogSource) -> ModelCatalogResult:
     checked_at = datetime.now(timezone.utc).isoformat()
 
-    if not source.api_key:
+    client_api_key = resolve_client_api_key(source.api_key, source.base_url)
+    if not client_api_key:
         return ModelCatalogResult(
             source=source,
             models=[],
@@ -349,7 +351,7 @@ async def discover_models_for_source(source: ModelCatalogSource) -> ModelCatalog
         )
 
     client = AsyncOpenAI(
-        api_key=source.api_key,
+        api_key=client_api_key,
         base_url=source.base_url,
         timeout=30.0,
         max_retries=0,

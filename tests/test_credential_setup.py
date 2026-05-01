@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from config.config import Config
 from utils.credential_setup import (
@@ -12,6 +13,11 @@ from utils.credential_setup import (
     suggested_base_url,
     upsert_env_file,
     validate_base_url,
+)
+from utils.provider_auth import (
+    LOCAL_API_KEY_PLACEHOLDER,
+    base_url_allows_missing_api_key,
+    resolve_client_api_key,
 )
 
 
@@ -57,6 +63,46 @@ class CredentialSetupTests(unittest.TestCase):
     def test_validate_base_url_requires_http_scheme_and_host(self) -> None:
         self.assertIsNone(validate_base_url("https://api.openai.com/v1"))
         self.assertIsNotNone(validate_base_url("api.openai.com/v1"))
+
+    def test_local_base_url_allows_missing_api_key(self) -> None:
+        self.assertTrue(base_url_allows_missing_api_key("http://localhost:11434/v1"))
+        self.assertTrue(base_url_allows_missing_api_key("http://127.0.0.1:8000/v1"))
+        self.assertFalse(base_url_allows_missing_api_key("https://api.openai.com/v1"))
+
+    def test_resolve_client_api_key_uses_placeholder_for_local_provider(self) -> None:
+        self.assertEqual(
+            resolve_client_api_key(None, "http://localhost:11434/v1"),
+            LOCAL_API_KEY_PLACEHOLDER,
+        )
+        self.assertIsNone(resolve_client_api_key(None, "https://api.openai.com/v1"))
+
+    def test_config_validation_skips_missing_key_for_local_profile(self) -> None:
+        config = Config(
+            cwd=Path("."),
+            active_model_profile="local",
+            models={
+                "local": {
+                    "base_url": "http://localhost:11434/v1",
+                }
+            },
+        )
+
+        self.assertEqual(config.validate(), [])
+        self.assertEqual(config.api_key_source_label, "local:no-key-required")
+        self.assertEqual(config.client_api_key, LOCAL_API_KEY_PLACEHOLDER)
+
+    def test_default_model_name_can_come_from_workspace_env(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "BASE_URL": "http://localhost:11434/v1",
+                "MODEL_NAME": "qwen2.5-coder:1.5b",
+            },
+            clear=True,
+        ):
+            config = Config(cwd=Path("."))
+            self.assertEqual(config.base_url, "http://localhost:11434/v1")
+            self.assertEqual(config.model_name, "qwen2.5-coder:1.5b")
 
     def test_upsert_env_file_updates_values_and_deduplicates_targets(self) -> None:
         with TemporaryDirectory() as tmpdir:

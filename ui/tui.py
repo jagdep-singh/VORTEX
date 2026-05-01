@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+import contextlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -225,6 +226,10 @@ class TUI:
         self._last_run_usage: TokenUsage | None = None
         self._prompt_notice_shown = False
         self._high_contrast = _is_high_contrast_enabled()
+        self._setup_screen_depth = 0
+        self._use_temporary_setup_screen = _truthy_env(
+            os.environ.get("VORTEX_ALT_SETUP_SCREEN", "1")
+        )
         self._prompt_session = None
         requested_prompt_toolkit = os.environ.get("VORTEX_USE_PROMPT_TOOLKIT", "")
         self._use_prompt_toolkit = requested_prompt_toolkit.lower() in {
@@ -317,6 +322,35 @@ class TUI:
         self._stop_assistant_live(keep_output=False)
         self._pause_live_status()
         self.console.clear(home=True)
+
+    def _can_use_temporary_setup_screen(self) -> bool:
+        return (
+            self._use_temporary_setup_screen
+            and sys.stdin.isatty()
+            and sys.stdout.isatty()
+        )
+
+    @contextlib.contextmanager
+    def _temporary_setup_screen(self):
+        entered = False
+        should_enter = (
+            self._can_use_temporary_setup_screen() and self._setup_screen_depth == 0
+        )
+        if should_enter:
+            with contextlib.suppress(Exception):
+                entered = self.console.set_alt_screen(True)
+        self._setup_screen_depth += 1
+        try:
+            yield
+        finally:
+            self._setup_screen_depth = max(0, self._setup_screen_depth - 1)
+            if entered and self._setup_screen_depth == 0:
+                self._stop_assistant_live(keep_output=False)
+                self._pause_live_status()
+                with contextlib.suppress(Exception):
+                    self.console.clear(home=True)
+                with contextlib.suppress(Exception):
+                    self.console.set_alt_screen(False)
 
     def _badge(self, label: str, style: str) -> Text:
         return Text(f" {label.upper()} ", style=style)
@@ -561,6 +595,18 @@ class TUI:
             ]
         )
 
+    def _local_model_prompt_message(self):
+        if FormattedText is None:
+            return None
+
+        return FormattedText(
+            [
+                ("", "\n"),
+                ("fg:#00e5e5", "setup "),
+                ("fg:#555555", "› "),
+            ]
+        )
+
     def _api_key_prompt_message(self):
         if FormattedText is None:
             return None
@@ -594,97 +640,98 @@ class TUI:
         error_message: str | None = None,
         info_message: str | None = None,
     ) -> str:
-        table = Table(expand=True, box=None, padding=(0, 1))
-        table.add_column("#", style="meta.label", no_wrap=True)
-        table.add_column("Directory", style="meta.value")
-        table.add_column("Notes", style="muted")
+        with self._temporary_setup_screen():
+            table = Table(expand=True, box=None, padding=(0, 1))
+            table.add_column("#", style="meta.label", no_wrap=True)
+            table.add_column("Directory", style="meta.value")
+            table.add_column("Notes", style="muted")
 
-        options: list[tuple[str, str, str]] = [
-            ("1", self._home_relative(current_dir), current_label),
-        ]
-
-        if fallback_dir.resolve() != current_dir.resolve():
-            options.append(("2", self._home_relative(fallback_dir), "Default workspace"))
-
-        next_index = len(options) + 1
-        for entry in recent_workspaces[:5]:
-            path = entry.get("path", "")
-            if not path:
-                continue
-            if Path(path).resolve() in {current_dir.resolve(), fallback_dir.resolve()}:
-                continue
-            last_used = entry.get("last_used", "") or "recent"
-            options.append((str(next_index), self._home_relative(path), last_used))
-            next_index += 1
-
-        options.append(
-            (
-                str(next_index),
-                "Custom path...",
-                "Enter a project directory manually",
-            )
-        )
-
-        for index, directory, note in options:
-            table.add_row(index, directory, note)
-
-        self.clear_screen()
-        self._print_startup_art(self._WORKSPACE_ART, "workspace setup")
-        self.console.print(Rule(style="panel.border"))
-        messages: list[Any] = [
-            Text("Choose a working directory for this session.", style="muted"),
-            Text(
-                f"Current shell directory: {self._home_relative(current_dir)}",
-                style="meta.value",
-            ),
-        ]
-
-        if error_message:
-            messages.extend([Text(), Text(error_message, style="error")])
-        elif info_message:
-            messages.extend([Text(), Text(info_message, style="warning")])
-
-        messages.extend(
-            [
-                Text(),
-                Text(
-                    "Choose a number or type any directory path on this machine.",
-                    style="muted",
-                ),
-                Text(
-                    "Absolute paths, ~/ paths, and paths relative to the current shell directory are all supported.",
-                    style="muted",
-                ),
-                Text(),
-                table,
+            options: list[tuple[str, str, str]] = [
+                ("1", self._home_relative(current_dir), current_label),
             ]
-        )
 
-        self.console.print(
-            self._panel(
-                Group(*messages),
-                title=Text.assemble(
-                    self._badge("CWD", "status.info.badge"),
-                    (" Workspace setup", "panel.title"),
+            if fallback_dir.resolve() != current_dir.resolve():
+                options.append(("2", self._home_relative(fallback_dir), "Default workspace"))
+
+            next_index = len(options) + 1
+            for entry in recent_workspaces[:5]:
+                path = entry.get("path", "")
+                if not path:
+                    continue
+                if Path(path).resolve() in {current_dir.resolve(), fallback_dir.resolve()}:
+                    continue
+                last_used = entry.get("last_used", "") or "recent"
+                options.append((str(next_index), self._home_relative(path), last_used))
+                next_index += 1
+
+            options.append(
+                (
+                    str(next_index),
+                    "Custom path...",
+                    "Enter a project directory manually",
+                )
+            )
+
+            for index, directory, note in options:
+                table.add_row(index, directory, note)
+
+            self.clear_screen()
+            self._print_startup_art(self._WORKSPACE_ART, "workspace setup")
+            self.console.print(Rule(style="panel.border"))
+            messages: list[Any] = [
+                Text("Choose a working directory for this session.", style="muted"),
+                Text(
+                    f"Current shell directory: {self._home_relative(current_dir)}",
+                    style="meta.value",
                 ),
-                subtitle=Text("startup", style="panel.subtitle"),
-            )
-        )
+            ]
 
-        default_choice = "1"
-        if self._prompt_session is not None and PathCompleter is not None:
-            return await self._prompt_session.prompt_async(
-                self._workspace_prompt_message(),
+            if error_message:
+                messages.extend([Text(), Text(error_message, style="error")])
+            elif info_message:
+                messages.extend([Text(), Text(info_message, style="warning")])
+
+            messages.extend(
+                [
+                    Text(),
+                    Text(
+                        "Choose a number or type any directory path on this machine.",
+                        style="muted",
+                    ),
+                    Text(
+                        "Absolute paths, ~/ paths, and paths relative to the current shell directory are all supported.",
+                        style="muted",
+                    ),
+                    Text(),
+                    table,
+                ]
+            )
+
+            self.console.print(
+                self._panel(
+                    Group(*messages),
+                    title=Text.assemble(
+                        self._badge("CWD", "status.info.badge"),
+                        (" Workspace setup", "panel.title"),
+                    ),
+                    subtitle=Text("startup", style="panel.subtitle"),
+                )
+            )
+
+            default_choice = "1"
+            if self._prompt_session is not None and PathCompleter is not None:
+                return await self._prompt_session.prompt_async(
+                    self._workspace_prompt_message(),
+                    default=default_choice,
+                    completer=PathCompleter(expanduser=True, only_directories=True),
+                    mouse_support=False,
+                )
+
+            return Prompt.ask(
+                "[meta.label]workspace/path[/meta.label] [prompt.hint]›[/prompt.hint]",
+                console=self.console,
                 default=default_choice,
-                completer=PathCompleter(expanduser=True, only_directories=True),
-                mouse_support=False,
             )
-
-        return Prompt.ask(
-            "[meta.label]workspace/path[/meta.label] [prompt.hint]›[/prompt.hint]",
-            console=self.console,
-            default=default_choice,
-        )
 
     async def prompt_custom_workspace_path(
         self,
@@ -693,57 +740,58 @@ class TUI:
         error_message: str | None = None,
         info_message: str | None = None,
     ) -> str:
-        self.clear_screen()
-        self._print_startup_art(self._WORKSPACE_ART, "custom workspace")
-        self.console.print(Rule(style="panel.border"))
-        body: list[Any] = [
-            Text("Enter a project directory to use as the active workspace.", style="muted"),
-            Text(
-                f"Relative paths resolve from: {self._home_relative(base_dir)}",
-                style="meta.value",
-            ),
-        ]
-
-        if error_message:
-            body.extend([Text(), Text(error_message, style="error")])
-        elif info_message:
-            body.extend([Text(), Text(info_message, style="warning")])
-
-        body.extend(
-            [
-                Text(),
-                Text("Examples:", style="meta.label"),
-                Text("~/projects/my-app", style="meta.value"),
-                Text("/Users/you/src/my-app", style="meta.value"),
-                Text("../shared-workspace", style="meta.value"),
-                Text(),
-                Text("Press Enter with no value to go back.", style="muted"),
-            ]
-        )
-
-        self.console.print(
-            self._panel(
-                Group(*body),
-                title=Text.assemble(
-                    self._badge("Path", "status.info.badge"),
-                    (" Custom workspace", "panel.title"),
+        with self._temporary_setup_screen():
+            self.clear_screen()
+            self._print_startup_art(self._WORKSPACE_ART, "custom workspace")
+            self.console.print(Rule(style="panel.border"))
+            body: list[Any] = [
+                Text("Enter a project directory to use as the active workspace.", style="muted"),
+                Text(
+                    f"Relative paths resolve from: {self._home_relative(base_dir)}",
+                    style="meta.value",
                 ),
-                subtitle=Text("startup", style="panel.subtitle"),
-            )
-        )
+            ]
 
-        if self._prompt_session is not None and PathCompleter is not None:
-            return await self._prompt_session.prompt_async(
-                self._path_prompt_message(),
-                completer=PathCompleter(expanduser=True, only_directories=True),
-                mouse_support=False,
+            if error_message:
+                body.extend([Text(), Text(error_message, style="error")])
+            elif info_message:
+                body.extend([Text(), Text(info_message, style="warning")])
+
+            body.extend(
+                [
+                    Text(),
+                    Text("Examples:", style="meta.label"),
+                    Text("~/projects/my-app", style="meta.value"),
+                    Text("/Users/you/src/my-app", style="meta.value"),
+                    Text("../shared-workspace", style="meta.value"),
+                    Text(),
+                    Text("Press Enter with no value to go back.", style="muted"),
+                ]
             )
 
-        return Prompt.ask(
-            "[meta.label]path[/meta.label] [prompt.hint]›[/prompt.hint]",
-            console=self.console,
-            default="",
-        )
+            self.console.print(
+                self._panel(
+                    Group(*body),
+                    title=Text.assemble(
+                        self._badge("Path", "status.info.badge"),
+                        (" Custom workspace", "panel.title"),
+                    ),
+                    subtitle=Text("startup", style="panel.subtitle"),
+                )
+            )
+
+            if self._prompt_session is not None and PathCompleter is not None:
+                return await self._prompt_session.prompt_async(
+                    self._path_prompt_message(),
+                    completer=PathCompleter(expanduser=True, only_directories=True),
+                    mouse_support=False,
+                )
+
+            return Prompt.ask(
+                "[meta.label]path[/meta.label] [prompt.hint]›[/prompt.hint]",
+                console=self.console,
+                default="",
+            )
 
     async def prompt_api_provider_url(
         self,
@@ -755,78 +803,253 @@ class TUI:
         error_message: str | None = None,
         info_message: str | None = None,
     ) -> str:
-        self.clear_screen()
-        self._print_startup_art(self._API_ART, "provider setup")
-        self.console.print(Rule(style="panel.border"))
-        body: list[Any] = [
-            Text(
-                "VORTEX needs an OpenAI-compatible provider URL before it can start.",
-                style="muted",
-            ),
-            Text(
-                f"Workspace: {self._home_relative(workspace_dir)}",
-                style="meta.value",
-            ),
-            Text(
-                f"Saved to: {self._home_relative(workspace_dir / '.env')}",
-                style="meta.value",
-            ),
-            Text(
-                f"API key variable: {api_key_env_name}",
-                style="meta.value",
-            ),
-        ]
-
-        if error_message:
-            body.extend([Text(), Text(error_message, style="error")])
-        elif info_message:
-            body.extend([Text(), Text(info_message, style="warning")])
-
-        body.extend(
-            [
-                Text(),
-                Text("Common provider URLs:", style="meta.label"),
-                Text("https://api.openai.com/v1", style="meta.value"),
-                Text("https://openrouter.ai/api/v1", style="meta.value"),
-                Text("http://localhost:11434/v1", style="meta.value"),
-                Text("https://generativelanguage.googleapis.com/v1beta/openai", style="meta.value"),
+        with self._temporary_setup_screen():
+            self.clear_screen()
+            self._print_startup_art(self._API_ART, "provider setup")
+            self.console.print(Rule(style="panel.border"))
+            body: list[Any] = [
+                Text(
+                    "VORTEX needs an OpenAI-compatible provider URL before it can start.",
+                    style="muted",
+                ),
+                Text(
+                    f"Workspace: {self._home_relative(workspace_dir)}",
+                    style="meta.value",
+                ),
+                Text(
+                    f"Saved to: {self._home_relative(workspace_dir / '.env')}",
+                    style="meta.value",
+                ),
+                Text(
+                    f"API key variable: {api_key_env_name}",
+                    style="meta.value",
+                ),
             ]
-        )
 
-        if docs_path is not None:
+            if error_message:
+                body.extend([Text(), Text(error_message, style="error")])
+            elif info_message:
+                body.extend([Text(), Text(info_message, style="warning")])
+
             body.extend(
                 [
                     Text(),
+                    Text("Common provider URLs:", style="meta.label"),
+                    Text("https://api.openai.com/v1", style="meta.value"),
+                    Text("https://openrouter.ai/api/v1", style="meta.value"),
+                    Text("http://localhost:11434/v1", style="meta.value"),
+                    Text("https://generativelanguage.googleapis.com/v1beta/openai", style="meta.value"),
+                    Text(),
                     Text(
-                        f"Need help choosing one? See {self._home_relative(docs_path)}",
+                        "Local URLs such as localhost usually do not need an API key.",
+                        style="muted",
+                    ),
+                    Text(
+                        "For a small local coding model, prefer qwen2.5-coder:1.5b.",
+                        style="muted",
+                    ),
+                    Text(
+                        "If the device can handle more, qwen2.5-coder:3b usually gives better coding quality.",
                         style="muted",
                     ),
                 ]
             )
 
-        self.console.print(
-            self._panel(
-                Group(*body),
-                title=Text.assemble(
-                    self._badge("API", "status.info.badge"),
-                    (" Provider setup", "panel.title"),
-                ),
-                subtitle=Text("startup", style="panel.subtitle"),
-            )
-        )
+            if docs_path is not None:
+                body.extend(
+                    [
+                        Text(),
+                        Text(
+                            f"Need help choosing one? See {self._home_relative(docs_path)}",
+                            style="muted",
+                        ),
+                    ]
+                )
 
-        if self._prompt_session is not None:
-            return await self._prompt_session.prompt_async(
-                self._provider_prompt_message(),
+            self.console.print(
+                self._panel(
+                    Group(*body),
+                    title=Text.assemble(
+                        self._badge("API", "status.info.badge"),
+                        (" Provider setup", "panel.title"),
+                    ),
+                    subtitle=Text("startup", style="panel.subtitle"),
+                )
+            )
+
+            if self._prompt_session is not None:
+                return await self._prompt_session.prompt_async(
+                    self._provider_prompt_message(),
+                    default=default_url,
+                    mouse_support=False,
+                )
+
+            return Prompt.ask(
+                "[meta.label]provider[/meta.label] [prompt.hint]›[/prompt.hint]",
+                console=self.console,
                 default=default_url,
-                mouse_support=False,
             )
 
-        return Prompt.ask(
-            "[meta.label]provider[/meta.label] [prompt.hint]›[/prompt.hint]",
-            console=self.console,
-            default=default_url,
-        )
+    async def prompt_local_model_choice(
+        self,
+        *,
+        workspace_dir: Path,
+        error_message: str | None = None,
+        info_message: str | None = None,
+    ) -> str:
+        with self._temporary_setup_screen():
+            self.clear_screen()
+            self._print_startup_art(self._API_ART, "local or external")
+            self.console.print(Rule(style="panel.border"))
+
+            options = Table.grid(expand=True)
+            options.add_column(style="meta.label", width=4)
+            options.add_column(style="meta.value", ratio=2)
+            options.add_column(style="muted", ratio=4)
+            options.add_row(
+                "1",
+                "Fast + light",
+                "Use Ollama with qwen2.5-coder:1.5b. Smaller download, quicker startup, easier on laptops.",
+            )
+            options.add_row(
+                "2",
+                "Better coding quality",
+                "Use Ollama with qwen2.5-coder:3b. Larger download, slower than 1.5b, but usually better edits and code fixes.",
+            )
+            options.add_row(
+                "3",
+                "External API",
+                "Use OpenAI, OpenRouter, Gemini, or another OpenAI-compatible provider instead.",
+            )
+
+            body: list[Any] = [
+                Text(
+                    "Choose how this workspace should get its model.",
+                    style="muted",
+                ),
+                Text(
+                    f"Workspace: {self._home_relative(workspace_dir)}",
+                    style="meta.value",
+                ),
+                Text(
+                    f"Saved to: {self._home_relative(workspace_dir / '.env')}",
+                    style="meta.value",
+                ),
+            ]
+
+            if error_message:
+                body.extend([Text(), Text(error_message, style="error")])
+            elif info_message:
+                body.extend([Text(), Text(info_message, style="warning")])
+
+            body.extend(
+                [
+                    Text(),
+                    Text(
+                        "If Ollama is missing, VORTEX can optionally help install it with permission.",
+                        style="muted",
+                    ),
+                    Text(
+                        "You can still switch models or providers later with /model and /api-change.",
+                        style="muted",
+                    ),
+                    Text(),
+                    options,
+                ]
+            )
+
+            self.console.print(
+                self._panel(
+                    Group(*body),
+                    title=Text.assemble(
+                        self._badge("Setup", "status.info.badge"),
+                        (" Model source", "panel.title"),
+                    ),
+                    subtitle=Text("startup", style="panel.subtitle"),
+                )
+            )
+
+            if self._prompt_session is not None:
+                return await self._prompt_session.prompt_async(
+                    self._local_model_prompt_message(),
+                    default="1",
+                    mouse_support=False,
+                )
+
+            return Prompt.ask(
+                "[meta.label]setup[/meta.label] [prompt.hint]›[/prompt.hint]",
+                console=self.console,
+                default="1",
+            )
+
+    async def prompt_setup_decision(
+        self,
+        *,
+        badge_label: str,
+        title: str,
+        workspace_dir: Path,
+        body_lines: list[str],
+        options: list[tuple[str, str, str]],
+        default_choice: str = "1",
+        error_message: str | None = None,
+        info_message: str | None = None,
+    ) -> str:
+        with self._temporary_setup_screen():
+            self.clear_screen()
+            self._print_startup_art(self._API_ART, "local setup")
+            self.console.print(Rule(style="panel.border"))
+
+            option_table = Table.grid(expand=True)
+            option_table.add_column(style="meta.label", width=4)
+            option_table.add_column(style="meta.value", ratio=2)
+            option_table.add_column(style="muted", ratio=4)
+            for key, label, note in options:
+                option_table.add_row(key, label, note)
+
+            body: list[Any] = [
+                Text(
+                    f"Workspace: {self._home_relative(workspace_dir)}",
+                    style="meta.value",
+                ),
+                Text(
+                    f"Saved to: {self._home_relative(workspace_dir / '.env')}",
+                    style="meta.value",
+                ),
+            ]
+
+            if error_message:
+                body.extend([Text(), Text(error_message, style="error")])
+            elif info_message:
+                body.extend([Text(), Text(info_message, style="warning")])
+
+            for line in body_lines:
+                body.extend([Text(), Text(line, style="muted")])
+
+            body.extend([Text(), option_table])
+
+            self.console.print(
+                self._panel(
+                    Group(*body),
+                    title=Text.assemble(
+                        self._badge(badge_label, "status.info.badge"),
+                        (f" {title}", "panel.title"),
+                    ),
+                    subtitle=Text("startup", style="panel.subtitle"),
+                )
+            )
+
+            if self._prompt_session is not None:
+                return await self._prompt_session.prompt_async(
+                    self._local_model_prompt_message(),
+                    default=default_choice,
+                    mouse_support=False,
+                )
+
+            return Prompt.ask(
+                "[meta.label]setup[/meta.label] [prompt.hint]›[/prompt.hint]",
+                console=self.console,
+                default=default_choice,
+            )
 
     async def prompt_api_key(
         self,
@@ -838,66 +1061,67 @@ class TUI:
         error_message: str | None = None,
         info_message: str | None = None,
     ) -> str:
-        self.clear_screen()
-        self._print_startup_art(self._API_ART, "api key setup")
-        self.console.print(Rule(style="panel.border"))
-        body: list[Any] = [
-            Text(
-                "Enter the API key for the provider you want this workspace to use.",
-                style="muted",
-            ),
-            Text(
-                f"Provider URL: {provider_url}",
-                style="meta.value",
-            ),
-            Text(
-                f"Saved to: {self._home_relative(workspace_dir / '.env')} as {api_key_env_name}",
-                style="meta.value",
-            ),
-            Text("The key is hidden while you type.", style="muted"),
-        ]
-
-        if error_message:
-            body.extend([Text(), Text(error_message, style="error")])
-        elif info_message:
-            body.extend([Text(), Text(info_message, style="warning")])
-
-        if docs_path is not None:
-            body.extend(
-                [
-                    Text(),
-                    Text(
-                        f"Need help getting a key? See {self._home_relative(docs_path)}",
-                        style="muted",
-                    ),
-                ]
-            )
-
-        self.console.print(
-            self._panel(
-                Group(*body),
-                title=Text.assemble(
-                    self._badge("API", "status.info.badge"),
-                    (" Key setup", "panel.title"),
+        with self._temporary_setup_screen():
+            self.clear_screen()
+            self._print_startup_art(self._API_ART, "api key setup")
+            self.console.print(Rule(style="panel.border"))
+            body: list[Any] = [
+                Text(
+                    "Enter the API key for the provider you want this workspace to use.",
+                    style="muted",
                 ),
-                subtitle=Text("startup", style="panel.subtitle"),
-            )
-        )
+                Text(
+                    f"Provider URL: {provider_url}",
+                    style="meta.value",
+                ),
+                Text(
+                    f"Saved to: {self._home_relative(workspace_dir / '.env')} as {api_key_env_name}",
+                    style="meta.value",
+                ),
+                Text("The key is hidden while you type.", style="muted"),
+            ]
 
-        if self._prompt_session is not None:
-            return await self._prompt_session.prompt_async(
-                self._api_key_prompt_message(),
+            if error_message:
+                body.extend([Text(), Text(error_message, style="error")])
+            elif info_message:
+                body.extend([Text(), Text(info_message, style="warning")])
+
+            if docs_path is not None:
+                body.extend(
+                    [
+                        Text(),
+                        Text(
+                            f"Need help getting a key? See {self._home_relative(docs_path)}",
+                            style="muted",
+                        ),
+                    ]
+                )
+
+            self.console.print(
+                self._panel(
+                    Group(*body),
+                    title=Text.assemble(
+                        self._badge("API", "status.info.badge"),
+                        (" Key setup", "panel.title"),
+                    ),
+                    subtitle=Text("startup", style="panel.subtitle"),
+                )
+            )
+
+            if self._prompt_session is not None:
+                return await self._prompt_session.prompt_async(
+                    self._api_key_prompt_message(),
+                    default="",
+                    is_password=True,
+                    mouse_support=False,
+                )
+
+            return Prompt.ask(
+                "[meta.label]api key[/meta.label] [prompt.hint]›[/prompt.hint]",
+                console=self.console,
                 default="",
-                is_password=True,
-                mouse_support=False,
+                password=True,
             )
-
-        return Prompt.ask(
-            "[meta.label]api key[/meta.label] [prompt.hint]›[/prompt.hint]",
-            console=self.console,
-            default="",
-            password=True,
-        )
 
     def print_welcome(self, *, release_info: ReleaseInfo | None = None) -> None:
         self._pause_live_status()
@@ -1864,6 +2088,53 @@ class TUI:
 
     def show_config(self) -> None:
         base_url = self.config.base_url or "default"
+        rows: list[tuple[str, object]] = [
+            ("Model", self.config.model_name),
+            (
+                "Active profile",
+                self.config.active_model_profile or "default",
+            ),
+            ("Base URL", base_url),
+            ("API key source", self.config.api_key_source_label),
+            ("Temperature", self.config.temperature),
+            ("Max output tokens", self.config.max_output_tokens),
+            ("Approval", self.config.approval.value),
+            ("Working dir", self.config.cwd),
+            ("Max turns", self.config.max_turns),
+            ("Configured profiles", len(self.config.models)),
+            ("Hooks enabled", self.config.hooks_enabled),
+        ]
+
+        if self.config.profile_uses_gemini_openai_compat(
+            self.config.active_model_profile
+        ):
+            gemini_overrides = self.config.request_overrides
+            if gemini_overrides.get("reasoning_effort"):
+                rows.append(
+                    ("Gemini reasoning", gemini_overrides["reasoning_effort"])
+                )
+
+            google = gemini_overrides.get("extra_body", {}).get("google", {})
+            thinking = google.get("thinking_config", {})
+            if thinking:
+                thinking_bits: list[str] = []
+                if "include_thoughts" in thinking:
+                    thinking_bits.append(
+                        f"include_thoughts={thinking['include_thoughts']}"
+                    )
+                if "thinking_level" in thinking:
+                    thinking_bits.append(
+                        f"thinking_level={thinking['thinking_level']}"
+                    )
+                if "thinking_budget" in thinking:
+                    thinking_bits.append(
+                        f"thinking_budget={thinking['thinking_budget']}"
+                    )
+                rows.append(("Gemini thinking", ", ".join(thinking_bits)))
+
+            if google.get("cached_content"):
+                rows.append(("Gemini cached content", google["cached_content"]))
+
         self.console.print()
         self.console.print(
             self._panel(
@@ -1873,24 +2144,7 @@ class TUI:
                         style="muted",
                     ),
                     Text(),
-                    self._kv_table(
-                        [
-                            ("Model", self.config.model_name),
-                            (
-                                "Active profile",
-                                self.config.active_model_profile or "default",
-                            ),
-                            ("Base URL", base_url),
-                            ("API key source", self.config.api_key_source_label),
-                            ("Temperature", self.config.temperature),
-                            ("Max output tokens", self.config.max_output_tokens),
-                            ("Approval", self.config.approval.value),
-                            ("Working dir", self.config.cwd),
-                            ("Max turns", self.config.max_turns),
-                            ("Configured profiles", len(self.config.models)),
-                            ("Hooks enabled", self.config.hooks_enabled),
-                        ]
-                    ),
+                    self._kv_table(rows),
                 ),
                 title=Text.assemble(
                     self._badge("Config", "status.info.badge"),

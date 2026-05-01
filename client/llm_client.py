@@ -14,6 +14,36 @@ from client.response import (
 from config.config import Config
 
 
+def _merge_tool_call_delta_payload(
+    payload: dict[str, Any],
+    tool_call_delta: Any,
+) -> dict[str, Any]:
+    if tool_call_delta.id:
+        payload["id"] = tool_call_delta.id
+    if tool_call_delta.type:
+        payload["type"] = tool_call_delta.type
+
+    for key, value in (tool_call_delta.model_extra or {}).items():
+        payload[key] = value
+
+    function = tool_call_delta.function
+    if not function:
+        return payload
+
+    function_payload = payload.setdefault("function", {})
+    if function.name:
+        function_payload["name"] = function.name
+    if function.arguments:
+        function_payload["arguments"] = (
+            function_payload.get("arguments", "") + function.arguments
+        )
+
+    for key, value in (function.model_extra or {}).items():
+        function_payload[key] = value
+
+    return payload
+
+
 class LLMClient:
     def __init__(self, config: Config) -> None:
         self._client: AsyncOpenAI | None = None
@@ -23,7 +53,7 @@ class LLMClient:
     def get_client(self) -> AsyncOpenAI:
         if self._client is None:
             self._client = AsyncOpenAI(
-                api_key=self.config.api_key,
+                api_key=self.config.client_api_key,
                 base_url=self.config.base_url,
                 timeout=30.0,
                 max_retries=0,
@@ -54,15 +84,14 @@ class LLMClient:
             for tool in tools
         ]
 
-    async def chat_completion(
+    def _build_chat_kwargs(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        stream: bool = True,
-    ) -> AsyncGenerator[StreamEvent, None]:
-        client = self.get_client()
-
-        kwargs = {
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
             "model": self.config.model_name,
             "messages": messages,
             "stream": stream,
@@ -73,6 +102,26 @@ class LLMClient:
         if tools:
             kwargs["tools"] = self._build_tools(tools)
             kwargs["tool_choice"] = "auto"
+
+        request_overrides = self.config.request_overrides
+        if request_overrides:
+            kwargs.update(request_overrides)
+
+        if stream and self.config.profile_uses_gemini_openai_compat(
+            self.config.active_model_profile
+        ):
+            kwargs.setdefault("stream_options", {"include_usage": True})
+
+        return kwargs
+
+    async def chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        stream: bool = True,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        client = self.get_client()
+        kwargs = self._build_chat_kwargs(messages, tools, stream=stream)
 
         for attempt in range(self._max_retries + 1):
             try:
@@ -163,12 +212,25 @@ class LLMClient:
                             "id": tool_call_delta.id or "",
                             "name": "",
                             "arguments": "",
+                            "raw_payload": {
+                                "id": tool_call_delta.id or "",
+                                "type": tool_call_delta.type or "function",
+                                "function": {
+                                    "name": "",
+                                    "arguments": "",
+                                },
+                            },
                         }
 
                     tool_call = tool_calls[idx]
 
                     if tool_call_delta.id:
                         tool_call["id"] = tool_call_delta.id
+
+                    _merge_tool_call_delta_payload(
+                        tool_call["raw_payload"],
+                        tool_call_delta,
+                    )
 
                     function = tool_call_delta.function
                     if function and function.name:
@@ -202,6 +264,7 @@ class LLMClient:
                     call_id=tc["id"],
                     name=tc["name"],
                     arguments=parse_tool_call_arguments(tc["arguments"]),
+                    raw_payload=tc["raw_payload"],
                 ),
             )
 
@@ -232,6 +295,7 @@ class LLMClient:
                         call_id=tc.id,
                         name=tc.function.name,
                         arguments=parse_tool_call_arguments(tc.function.arguments),
+                        raw_payload=tc.model_dump(exclude_none=True),
                     )
                 )
 

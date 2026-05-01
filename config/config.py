@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import Any
 from pydantic import BaseModel, Field, model_validator
+from utils.provider_auth import base_url_allows_missing_api_key, resolve_client_api_key
 
 
 class ModelConfig(BaseModel):
@@ -13,11 +14,69 @@ class ModelConfig(BaseModel):
     max_output_tokens: int = Field(default=8192, ge=256)
 
 
+class GeminiThinkingConfig(BaseModel):
+    include_thoughts: bool | None = None
+    thinking_budget: int | str | None = None
+    thinking_level: str | None = None
+
+    @model_validator(mode="after")
+    def validate_thinking_controls(self) -> GeminiThinkingConfig:
+        if self.thinking_budget is not None and self.thinking_level:
+            raise ValueError(
+                "Gemini thinking_config cannot set both thinking_budget and thinking_level."
+            )
+        return self
+
+
+class GeminiCompatConfig(BaseModel):
+    reasoning_effort: str | None = None
+    cached_content: str | None = None
+    thinking_config: GeminiThinkingConfig = Field(
+        default_factory=GeminiThinkingConfig
+    )
+
+    @model_validator(mode="after")
+    def validate_reasoning_controls(self) -> GeminiCompatConfig:
+        if self.reasoning_effort and (
+            self.thinking_config.thinking_budget is not None
+            or self.thinking_config.thinking_level
+        ):
+            raise ValueError(
+                "Gemini reasoning_effort cannot be combined with thinking_budget or thinking_level."
+            )
+        return self
+
+    def build_request_overrides(self) -> dict[str, Any]:
+        overrides: dict[str, Any] = {}
+        if self.reasoning_effort:
+            overrides["reasoning_effort"] = self.reasoning_effort
+
+        google: dict[str, Any] = {}
+        if self.cached_content:
+            google["cached_content"] = self.cached_content
+
+        thinking: dict[str, Any] = {}
+        if self.thinking_config.include_thoughts is not None:
+            thinking["include_thoughts"] = self.thinking_config.include_thoughts
+        if self.thinking_config.thinking_budget is not None:
+            thinking["thinking_budget"] = self.thinking_config.thinking_budget
+        if self.thinking_config.thinking_level:
+            thinking["thinking_level"] = self.thinking_config.thinking_level
+        if thinking:
+            google["thinking_config"] = thinking
+
+        if google:
+            overrides["extra_body"] = {"google": google}
+
+        return overrides
+
+
 class ModelProfileConfig(BaseModel):
     model: ModelConfig = Field(default_factory=ModelConfig)
     base_url: str | None = None
     api_key: str | None = None
     api_key_env: str | None = None
+    gemini: GeminiCompatConfig = Field(default_factory=GeminiCompatConfig)
 
     @property
     def resolved_api_key(self) -> str | None:
@@ -152,6 +211,9 @@ class Config(BaseModel):
         ):
             self.active_model_profile = next(iter(self.models))
 
+        if self.active_model_profile is None and os.environ.get("MODEL_NAME"):
+            self.model.name = os.environ["MODEL_NAME"]
+
         return self
 
     def get_model_profile(self, name: str) -> ModelProfileConfig | None:
@@ -214,8 +276,14 @@ class Config(BaseModel):
         return os.environ.get("BASE_URL") or "https://api.openai.com/v1"
 
     def resolve_profile_key_source_label(self, profile_name: str | None) -> str:
+        base_url = self.resolve_profile_base_url(profile_name)
+
         if profile_name is None:
-            return "env:API_KEY" if os.environ.get("API_KEY") else "missing:API_KEY"
+            if os.environ.get("API_KEY"):
+                return "env:API_KEY"
+            if base_url_allows_missing_api_key(base_url):
+                return "local:no-key-required"
+            return "missing:API_KEY"
 
         profile = self.models.get(profile_name)
         if profile is None:
@@ -227,10 +295,14 @@ class Config(BaseModel):
         if profile.api_key_env:
             if os.environ.get(profile.api_key_env):
                 return f"env:{profile.api_key_env}"
+            if base_url_allows_missing_api_key(base_url):
+                return "local:no-key-required"
             return f"missing:{profile.api_key_env}"
 
         if os.environ.get("API_KEY"):
             return "env:API_KEY"
+        if base_url_allows_missing_api_key(base_url):
+            return "local:no-key-required"
         return "missing:API_KEY"
 
     @property
@@ -243,6 +315,10 @@ class Config(BaseModel):
     @property
     def api_key(self) -> str | None:
         return self.resolve_profile_api_key(self.active_model_profile)
+
+    @property
+    def client_api_key(self) -> str | None:
+        return self.resolve_profile_client_api_key(self.active_model_profile)
 
     @property
     def base_url(self) -> str | None:
@@ -293,7 +369,9 @@ class Config(BaseModel):
     def validate(self) -> list[str]:
         errors: list[str] = []
 
-        if not self.api_key:
+        if not self.api_key and self.requires_api_key_for_profile(
+            self.active_model_profile
+        ):
             if self.active_model_profile:
                 errors.append(
                     "No API key found for active model profile "
@@ -310,6 +388,44 @@ class Config(BaseModel):
             errors.append(f"Working directory does not exist: {self.cwd}")
 
         return errors
+
+    def allows_missing_api_key_for_profile(self, profile_name: str | None) -> bool:
+        return base_url_allows_missing_api_key(
+            self.resolve_profile_base_url(profile_name)
+        )
+
+    def requires_api_key_for_profile(self, profile_name: str | None) -> bool:
+        return not self.allows_missing_api_key_for_profile(profile_name)
+
+    def resolve_profile_client_api_key(self, profile_name: str | None) -> str | None:
+        return resolve_client_api_key(
+            self.resolve_profile_api_key(profile_name),
+            self.resolve_profile_base_url(profile_name),
+        )
+
+    def profile_uses_gemini_openai_compat(self, profile_name: str | None) -> bool:
+        from utils.provider_auth import is_gemini_openai_compat_url
+
+        return is_gemini_openai_compat_url(
+            self.resolve_profile_base_url(profile_name)
+        )
+
+    def resolve_profile_request_overrides(
+        self,
+        profile_name: str | None,
+    ) -> dict[str, Any]:
+        if not self.profile_uses_gemini_openai_compat(profile_name):
+            return {}
+
+        profile = self.models.get(profile_name) if profile_name is not None else None
+        if profile is None:
+            return {}
+
+        return profile.gemini.build_request_overrides()
+
+    @property
+    def request_overrides(self) -> dict[str, Any]:
+        return self.resolve_profile_request_overrides(self.active_model_profile)
 
     def to_dict(self) -> dict[str, Any]:
         return self.model_dump(mode="json")

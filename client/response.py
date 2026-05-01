@@ -1,4 +1,5 @@
 from __future__ import annotations
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -51,6 +52,20 @@ class ToolCall:
     call_id: str
     name: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
+    raw_payload: dict[str, Any] = field(default_factory=dict)
+
+    def to_openai_dict(self) -> dict[str, Any]:
+        if self.raw_payload:
+            return deepcopy(self.raw_payload)
+
+        return {
+            "id": self.call_id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": json.dumps(self.arguments),
+            },
+        }
 
 
 @dataclass
@@ -68,14 +83,18 @@ class StreamEvent:
 class ToolResultMessage:
     tool_call_id: str
     content: str
+    name: str | None = None
     is_error: bool = False
 
     def to_openai_message(self) -> dict[str, Any]:
-        return {
+        message = {
             "role": "tool",
             "tool_call_id": self.tool_call_id,
             "content": self.content,
         }
+        if self.name:
+            message["name"] = self.name
+        return message
 
 
 def parse_tool_call_arguments(arguments_str: str) -> dict[str, Any]:

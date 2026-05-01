@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -103,6 +104,52 @@ class AssistantRenderingTests(unittest.TestCase):
         output = tui.console.export_text()
         self.assertIn("BAR", output)
         self.assertNotIn("secret123", output)
+
+    def test_show_config_includes_gemini_extras(self) -> None:
+        console = Console(
+            file=io.StringIO(),
+            theme=AGENT_THEME,
+            highlight=False,
+            force_terminal=True,
+            color_system="truecolor",
+            width=100,
+            record=True,
+        )
+        cfg = Config(
+            cwd=Path("."),
+            active_model_profile="gemini",
+            models={
+                "gemini": {
+                    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+                    "gemini": {
+                        "reasoning_effort": "low",
+                        "cached_content": "cachedContents/demo",
+                        "thinking_config": {
+                            "include_thoughts": True,
+                        },
+                    },
+                }
+            },
+        )
+        tui = TUI(cfg, console=console)
+
+        tui.show_config()
+        output = tui.console.export_text()
+        self.assertIn("Gemini reasoning", output)
+        self.assertIn("Gemini thinking", output)
+        self.assertIn("Gemini cached content", output)
+
+    def test_temporary_setup_screen_uses_alt_screen_when_interactive(self) -> None:
+        tui = self._make_tui()
+
+        with patch("sys.stdin.isatty", return_value=True), patch(
+            "sys.stdout.isatty",
+            return_value=True,
+        ), patch.object(tui.console, "set_alt_screen", side_effect=[True, True]) as alt:
+            with tui._temporary_setup_screen():
+                pass
+
+        self.assertEqual(alt.call_args_list, [call(True), call(False)])
 
 
 if __name__ == "__main__":
