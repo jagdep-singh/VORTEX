@@ -101,40 +101,27 @@ class MainStartupTests(unittest.TestCase):
             )
         )
 
-    def test_should_offer_local_model_choice_only_for_fresh_default_setup(self) -> None:
-        with patch.dict("os.environ", {}, clear=True):
-            config = main.Config(cwd=Path("."))
-            self.assertTrue(
-                main._should_offer_local_model_choice(
-                    config=config,
-                    initial_api_key_error=None,
-                    force_prompt_base_url=False,
-                )
-            )
-            self.assertFalse(
-                main._should_offer_local_model_choice(
-                    config=config,
-                    initial_api_key_error="missing key",
-                    force_prompt_base_url=False,
-                )
-            )
-            self.assertFalse(
-                main._should_offer_local_model_choice(
-                    config=config,
-                    initial_api_key_error=None,
-                    force_prompt_base_url=True,
-                )
-            )
-
-        with patch.dict("os.environ", {"BASE_URL": "http://localhost:11434/v1"}, clear=True):
-            config = main.Config(cwd=Path("."))
-            self.assertFalse(
-                main._should_offer_local_model_choice(
-                    config=config,
-                    initial_api_key_error=None,
-                    force_prompt_base_url=False,
-                )
-            )
+    def test_provider_prompt_helpers_support_local_shortcuts(self) -> None:
+        self.assertEqual(
+            main._provider_prompt_default_value("http://localhost:11434/v1"),
+            "1",
+        )
+        self.assertEqual(
+            main._provider_prompt_default_value("https://openrouter.ai/api/v1"),
+            "2",
+        )
+        self.assertEqual(
+            main._resolve_provider_prompt_input("1"),
+            main._LOCAL_PROVIDER_CHOICE,
+        )
+        self.assertEqual(
+            main._resolve_provider_prompt_input("openrouter"),
+            "https://openrouter.ai/api/v1",
+        )
+        self.assertEqual(
+            main._resolve_provider_prompt_input("https://example.com/v1"),
+            "https://example.com/v1",
+        )
 
     def test_should_repair_local_ollama_setup_only_for_default_local_workspaces(self) -> None:
         with patch.dict(
@@ -159,6 +146,17 @@ class MainStartupTests(unittest.TestCase):
                         provider="default",
                         model="qwen2.5-coder:1.5b",
                         status="offline",
+                        checked_at="2026-05-01T00:00:00+00:00",
+                    ),
+                )
+            )
+            self.assertFalse(
+                main._should_repair_local_ollama_setup(
+                    config=config,
+                    record=ModelHealthRecord(
+                        provider="default",
+                        model="qwen2.5-coder:1.5b",
+                        status="limited",
                         checked_at="2026-05-01T00:00:00+00:00",
                     ),
                 )
@@ -352,6 +350,53 @@ class MainLocalSetupAsyncTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(status, "external")
             self.assertIsNone(config)
+
+    async def test_requested_local_model_can_fall_back_to_smaller_fitting_option(self) -> None:
+        preferred_option = main.get_local_model_option("2")
+        smaller_option = main.get_local_model_option("1")
+        assert preferred_option is not None
+        assert smaller_option is not None
+
+        with TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            tui = _FakeSetupTUI(setup_choices=["1", "1"])
+
+            with patch("main.is_ollama_installed", return_value=True), patch(
+                "main.list_installed_models",
+                new=AsyncMock(
+                    side_effect=[
+                        [],
+                        [],
+                        [smaller_option.model_name],
+                    ]
+                ),
+            ), patch(
+                "main.get_free_space_bytes",
+                return_value=smaller_option.size_bytes
+                + (512 * 1024 * 1024)
+                + (32 * 1024 * 1024),
+            ), patch(
+                "main.get_total_memory_bytes",
+                return_value=4 * 1024 * 1024 * 1024,
+            ), patch(
+                "main.pull_model",
+                new=AsyncMock(return_value=None),
+            ) as pull_model_mock:
+                status, config = await main._complete_requested_local_ollama_model_setup(
+                    requested_cwd=workspace,
+                    tui=tui,
+                    model_name=preferred_option.model_name,
+                    allow_external=False,
+                )
+
+            self.assertEqual(status, "configured")
+            self.assertIsNotNone(config)
+            pull_model_mock.assert_awaited_once_with(
+                smaller_option.model_name,
+                progress_callback=unittest.mock.ANY,
+            )
+            env_text = (workspace / ".env").read_text(encoding="utf-8")
+            self.assertIn(f'MODEL_NAME="{smaller_option.model_name}"', env_text)
 
 
 if __name__ == "__main__":

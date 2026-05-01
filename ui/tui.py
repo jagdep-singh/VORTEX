@@ -461,6 +461,7 @@ class TUI:
         label = status or "unknown"
         style_map = {
             "working": "success",
+            "limited": "warning",
             "cached": "warning",
             "unknown": "muted",
             "missing-key": "warning",
@@ -477,11 +478,13 @@ class TUI:
         label = bucket or "not-working"
         style_map = {
             "working": "success",
+            "limited": "warning",
             "quota": "warning",
             "not-working": "error",
         }
         text_map = {
             "working": "working",
+            "limited": "limited",
             "quota": "quota",
             "not-working": "not working",
         }
@@ -603,6 +606,18 @@ class TUI:
             [
                 ("", "\n"),
                 ("fg:#00e5e5", "setup "),
+                ("fg:#555555", "› "),
+            ]
+        )
+
+    def _model_name_prompt_message(self):
+        if FormattedText is None:
+            return None
+
+        return FormattedText(
+            [
+                ("", "\n"),
+                ("fg:#00e5e5", "model "),
                 ("fg:#555555", "› "),
             ]
         )
@@ -797,7 +812,7 @@ class TUI:
         self,
         *,
         workspace_dir: Path,
-        default_url: str,
+        default_value: str,
         api_key_env_name: str,
         docs_path: Path | None = None,
         error_message: str | None = None,
@@ -807,6 +822,30 @@ class TUI:
             self.clear_screen()
             self._print_startup_art(self._API_ART, "provider setup")
             self.console.print(Rule(style="panel.border"))
+            options = Table.grid(expand=True)
+            options.add_column(style="meta.label", width=4)
+            options.add_column(style="meta.value", ratio=2)
+            options.add_column(style="muted", ratio=4)
+            options.add_row(
+                "1",
+                "Local models",
+                "Use Ollama on this device and choose or install a local model.",
+            )
+            options.add_row(
+                "2",
+                "OpenRouter",
+                "Use https://openrouter.ai/api/v1",
+            )
+            options.add_row(
+                "3",
+                "OpenAI",
+                "Use https://api.openai.com/v1",
+            )
+            options.add_row(
+                "4",
+                "Gemini",
+                "Use https://generativelanguage.googleapis.com/v1beta/openai",
+            )
             body: list[Any] = [
                 Text(
                     "VORTEX needs an OpenAI-compatible provider URL before it can start.",
@@ -834,22 +873,19 @@ class TUI:
             body.extend(
                 [
                     Text(),
-                    Text("Common provider URLs:", style="meta.label"),
-                    Text("https://api.openai.com/v1", style="meta.value"),
-                    Text("https://openrouter.ai/api/v1", style="meta.value"),
-                    Text("http://localhost:11434/v1", style="meta.value"),
-                    Text("https://generativelanguage.googleapis.com/v1beta/openai", style="meta.value"),
+                    Text("Quick choices:", style="meta.label"),
+                    options,
                     Text(),
                     Text(
-                        "Local URLs such as localhost usually do not need an API key.",
+                        "You can also paste any custom OpenAI-compatible base URL directly.",
                         style="muted",
                     ),
                     Text(
-                        "For a small local coding model, prefer qwen2.5-coder:1.5b.",
+                        "Choosing Local models will walk through Ollama install, startup, and model setup for this device.",
                         style="muted",
                     ),
                     Text(
-                        "If the device can handle more, qwen2.5-coder:3b usually gives better coding quality.",
+                        "Local Ollama setups usually do not need an API key.",
                         style="muted",
                     ),
                 ]
@@ -880,14 +916,125 @@ class TUI:
             if self._prompt_session is not None:
                 return await self._prompt_session.prompt_async(
                     self._provider_prompt_message(),
-                    default=default_url,
+                    default=default_value,
                     mouse_support=False,
                 )
 
             return Prompt.ask(
                 "[meta.label]provider[/meta.label] [prompt.hint]›[/prompt.hint]",
                 console=self.console,
-                default=default_url,
+                default=default_value,
+            )
+
+    async def prompt_local_model_name(
+        self,
+        *,
+        workspace_dir: Path,
+        current_model_name: str,
+        installed_models: list[str],
+        recommended_models: list[tuple[str, str, str]],
+        free_space_label: str,
+        memory_label: str | None,
+        error_message: str | None = None,
+        info_message: str | None = None,
+    ) -> str:
+        with self._temporary_setup_screen():
+            self.clear_screen()
+            self._print_startup_art(self._API_ART, "local model change")
+            self.console.print(Rule(style="panel.border"))
+
+            installed_table = Table.grid(expand=True)
+            installed_table.add_column(style="meta.label", width=4)
+            installed_table.add_column(style="meta.value", ratio=4)
+            if installed_models:
+                for index, model_name in enumerate(installed_models, start=1):
+                    installed_table.add_row(str(index), model_name)
+            else:
+                installed_table.add_row("-", "No local Ollama models are installed yet.")
+
+            recommended_table = Table.grid(expand=True)
+            recommended_table.add_column(style="meta.value", ratio=3)
+            recommended_table.add_column(style="muted", ratio=5)
+            if recommended_models:
+                for model_name, summary, note in recommended_models:
+                    label = model_name if not summary else f"{model_name} ({summary})"
+                    recommended_table.add_row(label, note)
+            else:
+                recommended_table.add_row(
+                    "No built-in recommendations fit the current machine checks.",
+                    "You can still type any Ollama model name to try manually.",
+                )
+
+            body: list[Any] = [
+                Text(
+                    f"Current model: {current_model_name}",
+                    style="meta.value",
+                ),
+                Text(
+                    f"Workspace: {self._home_relative(workspace_dir)}",
+                    style="meta.value",
+                ),
+                Text(
+                    f"Free model storage: {free_space_label}",
+                    style="meta.value",
+                ),
+            ]
+
+            if memory_label is not None:
+                body.append(
+                    Text(
+                        f"System memory: {memory_label}",
+                        style="meta.value",
+                    )
+                )
+
+            if error_message:
+                body.extend([Text(), Text(error_message, style="error")])
+            elif info_message:
+                body.extend([Text(), Text(info_message, style="warning")])
+
+            body.extend(
+                [
+                    Text(),
+                    Text("Installed local models on this machine", style="meta.label"),
+                    installed_table,
+                    Text(),
+                    Text("Recommended models that fit these machine checks", style="meta.label"),
+                    recommended_table,
+                    Text(),
+                    Text(
+                        "Type an installed model number to switch immediately, or type any Ollama model name to install and use it.",
+                        style="muted",
+                    ),
+                    Text(
+                        "Press Enter with no value to cancel.",
+                        style="muted",
+                    ),
+                ]
+            )
+
+            self.console.print(
+                self._panel(
+                    Group(*body),
+                    title=Text.assemble(
+                        self._badge("Local", "status.info.badge"),
+                        (" Change model", "panel.title"),
+                    ),
+                    subtitle=Text("startup", style="panel.subtitle"),
+                )
+            )
+
+            if self._prompt_session is not None:
+                return await self._prompt_session.prompt_async(
+                    self._model_name_prompt_message(),
+                    default="",
+                    mouse_support=False,
+                )
+
+            return Prompt.ask(
+                "[meta.label]model[/meta.label] [prompt.hint]›[/prompt.hint]",
+                console=self.console,
+                default="",
             )
 
     async def prompt_local_model_choice(
@@ -950,7 +1097,7 @@ class TUI:
                         style="muted",
                     ),
                     Text(
-                        "You can still switch models or providers later with /model and /api-change.",
+                        "You can still switch local models later with /change-model, or switch providers with /api-change.",
                         style="muted",
                     ),
                     Text(),
@@ -2206,31 +2353,41 @@ class TUI:
         for bucket, entries in grouped_models:
             status_title = self._model_bucket_text(bucket)
             status_title.append(f" ({len(entries)})", style="muted")
+            show_note_column = any(entry.note for entry in entries)
 
             section_table = Table(expand=True, box=None, padding=(0, 1))
             section_table.add_column("#", style="meta.label", no_wrap=True)
             section_table.add_column("Model ID", style="meta.value")
             section_table.add_column("Profile", style="muted", no_wrap=True)
             section_table.add_column("Reason", no_wrap=True)
+            if show_note_column:
+                section_table.add_column("Note", style="muted")
             section_table.add_column("Base URL", style="muted")
             section_table.add_column("Checked", style="muted", no_wrap=True)
             section_table.add_column("Active", style="meta.value", no_wrap=True)
 
             for entry in entries:
-                section_table.add_row(
+                row = [
                     str(entry.index),
                     entry.model_name,
                     entry.display_name,
                     self._model_status_text(entry.status),
-                    entry.base_url,
-                    self._format_checked_at(entry.checked_at),
-                    (
+                ]
+                if show_note_column:
+                    row.append(self._short_text(entry.note, 72))
+                row.extend(
+                    [
+                        entry.base_url,
+                        self._format_checked_at(entry.checked_at),
+                        (
                         "yes"
                         if config.active_model_profile == entry.profile_name
                         and config.model_name == entry.model_name
                         else ""
-                    ),
+                        ),
+                    ]
                 )
+                section_table.add_row(*row)
 
             model_sections.extend([status_title, section_table, Text()])
 
@@ -2530,6 +2687,7 @@ class TUI:
         commands.add_row(Text("/models [refresh]"), "List model profiles and discover models for each configured API key")
         commands.add_row(Text("/model <name|number>"), "Switch profile, pick a discovered model, or change the model name")
         commands.add_row(Text("/model force <name|number>"), "Change the model name directly even if it is not in the discovered list")
+        commands.add_row(Text("/change-model"), "When using local Ollama, switch installed models or install another local model")
         commands.add_row(Text("/approval <mode>"), "Change approval mode")
         commands.add_row(Text("/stats"), "Show session statistics")
         commands.add_row(Text("/tools"), "List available tools")

@@ -259,16 +259,53 @@ class ModelHealthChecker:
         model: str,
     ) -> ModelHealthRecord:
         try:
-            await client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=model,
                 messages=[
                     {
                         "role": "user",
-                        "content": "Reply with OK.",
+                        "content": (
+                            "Tool-use smoke test: call the function report_ready with "
+                            '{"status":"ok"} and do not answer with plain text.'
+                        ),
                     }
                 ],
-                max_tokens=1,
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "report_ready",
+                            "description": "Report that tool calling works.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "status": {
+                                        "type": "string",
+                                    }
+                                },
+                                "required": ["status"],
+                            },
+                        },
+                    }
+                ],
+                tool_choice="auto",
+                max_tokens=16,
+                temperature=0,
             )
+            message = response.choices[0].message
+            if not getattr(message, "tool_calls", None):
+                plain_text = " ".join((message.content or "").split())
+                detail = (
+                    "Returned plain text instead of a tool call during the agent tool-use smoke test."
+                )
+                if plain_text:
+                    detail += f" Last reply: {plain_text[:120]}"
+                return ModelHealthRecord.create(
+                    provider=self.provider,
+                    model=model,
+                    status="limited",
+                    detail=detail,
+                )
             return ModelHealthRecord.create(
                 provider=self.provider,
                 model=model,
@@ -290,6 +327,22 @@ class ModelHealthChecker:
                 detail=detail,
             )
         except APIError as exc:
+            detail_text = " ".join(str(exc).split())
+            lowered = detail_text.lower()
+            if (
+                "invalid argument" in lowered
+                or "tool" in lowered
+                or "function" in lowered
+            ):
+                return ModelHealthRecord.create(
+                    provider=self.provider,
+                    model=model,
+                    status="limited",
+                    detail=(
+                        "Provider rejected the agent tool-use smoke test. "
+                        + detail_text
+                    ),
+                )
             status, detail = classify_error_text(str(exc))
             return ModelHealthRecord.create(
                 provider=self.provider,

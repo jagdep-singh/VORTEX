@@ -51,14 +51,20 @@ from utils.ollama_setup import (
     OLLAMA_OPENAI_BASE_URL,
     LocalModelOption,
     build_ollama_install_shell_command,
+    describe_local_model_requirement,
+    fitting_local_model_options,
     format_bytes,
     get_free_space_bytes,
     get_local_model_option,
     get_local_model_option_by_name,
+    get_total_memory_bytes,
     has_enough_space,
     is_ollama_base_url,
     is_ollama_installed,
+    is_lightweight_local_model,
     list_installed_models,
+    local_model_requirement_issues,
+    lightweight_local_model_warning,
     ollama_install_docs_url,
     pull_model,
     resolve_ollama_models_dir,
@@ -126,6 +132,35 @@ def _activate_workspace_env(cwd: Path) -> None:
     ACTIVE_WORKSPACE_ENV = env_values
 
 console = get_console()
+_LOCAL_PROVIDER_CHOICE = "__local_models__"
+_PROVIDER_PRESETS = {
+    "2": "https://openrouter.ai/api/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "3": "https://api.openai.com/v1",
+    "openai": "https://api.openai.com/v1",
+    "4": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai",
+}
+
+
+def _provider_prompt_default_value(provider_url: str) -> str:
+    normalized = normalize_base_url(provider_url)
+    if normalized == OLLAMA_OPENAI_BASE_URL:
+        return "1"
+    for choice, preset_url in _PROVIDER_PRESETS.items():
+        if choice.isdigit() and normalized == normalize_base_url(preset_url):
+            return choice
+    return normalized
+
+
+def _resolve_provider_prompt_input(raw_value: str) -> str:
+    value = raw_value.strip()
+    lowered = value.lower()
+    if lowered in {"1", "local", "ollama"}:
+        return _LOCAL_PROVIDER_CHOICE
+    if lowered in _PROVIDER_PRESETS:
+        return _PROVIDER_PRESETS[lowered]
+    return normalize_base_url(value)
 
 
 class CLI:
@@ -653,6 +688,16 @@ class CLI:
         self._invalidate_model_catalog()
         await self._reset_model_client()
 
+    def _current_model_capability_notice(self) -> tuple[str, str] | None:
+        if is_lightweight_local_model(
+            self.config.model_name,
+            self.config.base_url,
+        ):
+            warning = lightweight_local_model_warning(self.config.model_name)
+            if warning:
+                return warning, "warning"
+        return None
+
     async def _ensure_working_model(
         self,
         *,
@@ -677,7 +722,18 @@ class CLI:
         current_model_name = self.config.model_name
 
         if current_record and current_record.status == "working":
-            return None
+            return self._current_model_capability_notice()
+
+        if current_record and current_record.status == "limited":
+            detail = (current_record.detail or "").strip()
+            warning = (
+                detail
+                or "The current model responds, but it did not reliably use tools during the agent smoke test."
+            )
+            lightweight_warning = self._current_model_capability_notice()
+            if lightweight_warning:
+                warning = f"{warning} {lightweight_warning[0]}"
+            return warning, "warning"
 
         if allow_local_repair and _should_repair_local_ollama_setup(
             config=self.config,
@@ -1053,11 +1109,13 @@ class CLI:
                 return True
             else:
                 model_catalog = await self._get_model_catalog()
-            self.tui.show_model_profiles(
-                self.config,
-                model_catalog=model_catalog,
-                model_health=self._get_model_health_index(model_catalog),
-            )
+                self.tui.show_model_profiles(
+                    self.config,
+                    model_catalog=model_catalog,
+                    model_health=self._get_model_health_index(model_catalog),
+                )
+        elif cmd_name_lower == "/change-model":
+            await self._change_local_model()
         elif cmd_name_lower == "/model":
             if cmd_args:
                 target = cmd_args.strip()
@@ -1103,6 +1161,12 @@ class CLI:
                                 "is currently resolved for it.",
                                 level="warning",
                             )
+                        capability_notice = self._current_model_capability_notice()
+                        if capability_notice:
+                            self.tui.show_notice(
+                                capability_notice[0],
+                                level=capability_notice[1],
+                            )
                     except ValueError as exc:
                         self.tui.show_notice(str(exc), level="error")
                 elif target.isdigit():
@@ -1145,6 +1209,12 @@ class CLI:
                             f"Model changed to: {target}",
                             level="success",
                         )
+                        capability_notice = self._current_model_capability_notice()
+                        if capability_notice:
+                            self.tui.show_notice(
+                                capability_notice[0],
+                                level=capability_notice[1],
+                            )
             else:
                 self.tui.show_notice(
                     "Current model: "
@@ -1446,6 +1516,130 @@ class CLI:
                 level="warning",
             )
 
+        capability_notice = self._current_model_capability_notice()
+        if capability_notice:
+            self.tui.show_notice(
+                capability_notice[0],
+                level=capability_notice[1],
+            )
+
+    async def _change_local_model(self) -> None:
+        if not is_ollama_base_url(self.config.base_url):
+            self.tui.show_notice(
+                "/change-model is available when the active provider is local Ollama.",
+                level="error",
+            )
+            self.tui.show_notice(
+                "Use /api-change to switch this workspace to Local models first.",
+                level="info",
+            )
+            return
+
+        prompt_error: str | None = None
+        prompt_info = (
+            "Installed models come from the local Ollama server. "
+            "You can also type any Ollama model name to install it."
+        )
+
+        while True:
+            installed_models: list[str] = []
+            if is_ollama_installed():
+                try:
+                    installed_models = await list_installed_models()
+                except Exception as exc:
+                    prompt_info = (
+                        "Installed models will appear once Ollama is running. "
+                        "You can still type a model name and VORTEX will help start it."
+                    )
+                    if prompt_error is None:
+                        prompt_error = _clean_error_message(exc)
+
+            free_bytes = get_free_space_bytes(resolve_ollama_models_dir())
+            total_memory_bytes = get_total_memory_bytes()
+            selection = (
+                await self.tui.prompt_local_model_name(
+                    workspace_dir=self.config.cwd,
+                    current_model_name=self.config.model_name,
+                    installed_models=installed_models,
+                    recommended_models=_recommended_local_model_rows(
+                        free_bytes=free_bytes,
+                        total_memory_bytes=total_memory_bytes,
+                    ),
+                    free_space_label=format_bytes(free_bytes),
+                    memory_label=(
+                        format_bytes(total_memory_bytes)
+                        if total_memory_bytes is not None
+                        else None
+                    ),
+                    error_message=prompt_error,
+                    info_message=prompt_info,
+                )
+            ).strip()
+
+            if not selection:
+                self.tui.show_notice("Local model change cancelled.", level="info")
+                return
+
+            selected_model = selection
+            if selection.isdigit():
+                selected_index = int(selection) - 1
+                if 0 <= selected_index < len(installed_models):
+                    selected_model = installed_models[selected_index]
+                else:
+                    prompt_error = f"No installed local model at index {selection}."
+                    prompt_info = "Type an installed model number or any Ollama model name."
+                    continue
+
+            status, reloaded_config = await _complete_requested_local_ollama_model_setup(
+                requested_cwd=self.config.cwd,
+                tui=self.tui,
+                model_name=selected_model,
+                allow_external=False,
+            )
+            if status == "back":
+                prompt_error = None
+                prompt_info = "Enter another local model name or choose an installed model number."
+                continue
+            if status != "configured":
+                self.tui.show_notice(
+                    "Local model change was not completed.",
+                    level="warning",
+                )
+                return
+
+            persisted_model_name = (
+                _read_env_values(self.config.cwd / ".env").get("MODEL_NAME")
+                or reloaded_config.model_name
+                if reloaded_config is not None
+                else selected_model
+            )
+            self.config.model_name = persisted_model_name
+            if self.agent:
+                self.agent.config.model_name = persisted_model_name
+                if self.agent.session:
+                    self.agent.session.refresh_workspace_context()
+            self.tui.set_config(self.config)
+            self._invalidate_model_catalog()
+            await self._reset_model_client()
+
+            self.tui.show_notice(
+                f"Local model changed to: {persisted_model_name}",
+                level="success",
+            )
+            if self.config.active_model_profile is not None:
+                self.tui.show_notice(
+                    "This local model change is active for the current session. Update the profile config to make it permanent.",
+                    level="info",
+                )
+
+            capability_notice = self._current_model_capability_notice()
+            if capability_notice:
+                self.tui.show_notice(
+                    capability_notice[0],
+                    level=capability_notice[1],
+                )
+            return
+
 
 def _load_config_with_errors(requested_cwd: Path) -> tuple[Config, list[str]]:
     validated_cwd = _validate_workspace_directory(requested_cwd)
@@ -1506,24 +1700,12 @@ async def _prompt_for_missing_api_credentials(
         docs_path = None
     prompt_for_base_url = force_prompt_base_url or should_prompt_for_base_url(config)
 
-    if _should_offer_local_model_choice(
-        config=config,
-        initial_api_key_error=initial_api_key_error,
-        force_prompt_base_url=force_prompt_base_url,
-    ):
-        local_config = await _prompt_for_local_ollama_setup(
-            requested_cwd=requested_cwd,
-            tui=tui,
-        )
-        if local_config is not None:
-            return local_config
-
     while True:
         if prompt_for_base_url:
             provider_input = (
                 await tui.prompt_api_provider_url(
                     workspace_dir=requested_cwd,
-                    default_url=provider_url,
+                    default_value=_provider_prompt_default_value(provider_url),
                     api_key_env_name=api_key_env_name,
                     docs_path=docs_path,
                     error_message=provider_error,
@@ -1532,7 +1714,16 @@ async def _prompt_for_missing_api_credentials(
                     ),
                 )
             ).strip()
-            provider_url = normalize_base_url(provider_input or provider_url)
+            provider_url = _resolve_provider_prompt_input(provider_input or provider_url)
+            if provider_url == _LOCAL_PROVIDER_CHOICE:
+                local_config = await _prompt_for_local_ollama_setup(
+                    requested_cwd=requested_cwd,
+                    tui=tui,
+                )
+                if local_config is not None:
+                    return local_config
+                provider_error = None
+                continue
             provider_error = validate_base_url(provider_url)
             if provider_error:
                 continue
@@ -1791,6 +1982,405 @@ async def _start_ollama_with_permission(
     return True, None
 
 
+def _local_model_download_lines(
+    *,
+    model_name: str,
+    free_bytes: int,
+    total_memory_bytes: int | None,
+) -> list[str]:
+    requirement = describe_local_model_requirement(model_name)
+    lines = [f"Model: {model_name}"]
+
+    if requirement.approx_download_bytes is not None:
+        label = "Approx download" if requirement.source == "exact" else "Estimated download"
+        lines.append(f"{label}: {format_bytes(requirement.approx_download_bytes)}")
+    else:
+        lines.append(
+            "VORTEX could not estimate this model's download size from its name."
+        )
+
+    if requirement.recommended_memory_bytes is not None:
+        lines.append(
+            f"Recommended system memory: about {format_bytes(requirement.recommended_memory_bytes)}"
+        )
+    elif total_memory_bytes is not None:
+        lines.append(
+            "VORTEX could not estimate this model's memory footprint in advance."
+        )
+
+    lines.append(f"Free model storage: {format_bytes(free_bytes)}")
+    if total_memory_bytes is not None:
+        lines.append(f"System memory detected: {format_bytes(total_memory_bytes)}")
+
+    return lines
+
+
+def _recommended_local_model_rows(
+    *,
+    free_bytes: int,
+    total_memory_bytes: int | None,
+    exclude_models: set[str] | None = None,
+) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for option in fitting_local_model_options(
+        free_bytes=free_bytes,
+        total_memory_bytes=total_memory_bytes,
+        exclude_models=exclude_models,
+    ):
+        rows.append(
+            (
+                option.model_name,
+                format_bytes(option.size_bytes),
+                (
+                    f"{option.title}. {option.description} "
+                    f"Recommended memory: about {format_bytes(option.recommended_memory_bytes)}."
+                ),
+            )
+        )
+    return rows
+
+
+async def _prompt_for_local_model_alternative(
+    *,
+    requested_cwd: Path,
+    tui: TUI,
+    model_name: str,
+    free_bytes: int,
+    total_memory_bytes: int | None,
+    issues: list[str],
+    allow_external: bool,
+    error_message: str | None = None,
+) -> str:
+    alternatives = _recommended_local_model_rows(
+        free_bytes=free_bytes,
+        total_memory_bytes=total_memory_bytes,
+        exclude_models={model_name},
+    )
+    options: list[tuple[str, str, str]] = []
+    model_choices: dict[str, str] = {}
+
+    for index, (recommended_name, summary, note) in enumerate(alternatives, start=1):
+        choice = str(index)
+        options.append(choice)
+        model_choices[choice] = recommended_name
+
+    choice_rows = [
+        (
+            key,
+            model_choices[key],
+            next(note for name, _, note in alternatives if name == model_choices[key]),
+        )
+        for key in model_choices
+    ]
+
+    retry_choice = str(len(choice_rows) + 1)
+    back_choice = str(len(choice_rows) + 2)
+    option_rows = list(choice_rows)
+    option_rows.append(
+        (
+            retry_choice,
+            "Retry",
+            "Re-check machine storage and memory after making changes.",
+        )
+    )
+    option_rows.append(
+        (
+            back_choice,
+            "Back",
+            "Return and enter another local model name.",
+        )
+    )
+
+    external_choice: str | None = None
+    if allow_external:
+        external_choice = str(len(option_rows) + 1)
+        option_rows.append(
+            (
+                external_choice,
+                "External API",
+                "Skip local setup for now.",
+            )
+        )
+
+    choice = await _prompt_validated_setup_decision(
+        tui=tui,
+        badge_label="Local",
+        title="Model requirements",
+        workspace_dir=requested_cwd,
+        body_lines=issues
+        + [
+            f"Requested model: {model_name}",
+            f"Free model storage: {format_bytes(free_bytes)}",
+        ]
+        + (
+            [f"System memory detected: {format_bytes(total_memory_bytes)}"]
+            if total_memory_bytes is not None
+            else []
+        ),
+        options=option_rows,
+        default_choice=next(iter(model_choices), retry_choice),
+        error_message=error_message,
+        info_message=(
+            "Choose a recommended model that fits this device, retry after freeing resources, or go back."
+        ),
+    )
+
+    if choice in model_choices:
+        return model_choices[choice]
+    if choice == retry_choice:
+        return "__retry__"
+    if choice == back_choice:
+        return "__back__"
+    return "__external__"
+
+
+async def _complete_requested_local_ollama_model_setup(
+    *,
+    requested_cwd: Path,
+    tui: TUI,
+    model_name: str,
+    allow_external: bool = True,
+) -> tuple[str, Config | None]:
+    env_path = requested_cwd / ".env"
+    install_error: str | None = None
+    start_error: str | None = None
+
+    while True:
+        if not is_ollama_installed():
+            if supports_automatic_ollama_install():
+                choice = await _prompt_validated_setup_decision(
+                    tui=tui,
+                    badge_label="Local",
+                    title="Ollama missing",
+                    workspace_dir=requested_cwd,
+                    body_lines=[
+                        "Ollama is not installed on this device yet.",
+                        "VORTEX can run Ollama's official installer if you want.",
+                        f"Manual docs: {ollama_install_docs_url()}",
+                    ],
+                    options=[
+                        (
+                            "1",
+                            "Install Ollama",
+                            "Run the official Ollama installer with your permission.",
+                        ),
+                        ("2", "Retry", "Check again after installing Ollama."),
+                        ("3", "Back", "Return and choose another local model."),
+                        ("4", "External API", "Skip local setup for now."),
+                    ]
+                    if allow_external
+                    else [
+                        (
+                            "1",
+                            "Install Ollama",
+                            "Run the official Ollama installer with your permission.",
+                        ),
+                        ("2", "Retry", "Check again after installing Ollama."),
+                        ("3", "Back", "Return and choose another local model."),
+                    ],
+                    error_message=install_error,
+                    info_message=f"Local setup targets {model_name} once Ollama is available.",
+                )
+                if choice == "1":
+                    installed, result = await _install_ollama_with_permission(
+                        requested_cwd=requested_cwd,
+                        tui=tui,
+                        allow_external=allow_external,
+                    )
+                    if installed:
+                        install_error = None
+                        continue
+                    if result == "__external__":
+                        return "external", None
+                    if result:
+                        install_error = result
+                    continue
+                if choice == "2":
+                    install_error = None
+                    continue
+                if choice == "3":
+                    return "back", None
+                return "external", None
+
+            choice = await _prompt_validated_setup_decision(
+                tui=tui,
+                badge_label="Local",
+                title="Ollama missing",
+                workspace_dir=requested_cwd,
+                body_lines=[
+                    "Ollama is not installed on this device yet.",
+                    "Install Ollama first, then come back and choose Retry.",
+                    f"Manual docs: {ollama_install_docs_url()}",
+                ],
+                options=_local_setup_options(
+                    primary=("1", "Retry", "Check again after installing Ollama."),
+                    secondary=("2", "Back", "Return and choose another local model."),
+                    allow_external=allow_external,
+                ),
+                error_message=install_error,
+                info_message=f"Local setup targets {model_name} once Ollama is available.",
+            )
+            if choice == "1":
+                install_error = None
+                continue
+            if choice == "2":
+                return "back", None
+            return "external", None
+
+        try:
+            installed_models = await list_installed_models()
+        except Exception as exc:
+            choice = await _prompt_validated_setup_decision(
+                tui=tui,
+                badge_label="Local",
+                title="Ollama not running",
+                workspace_dir=requested_cwd,
+                body_lines=[
+                    "Ollama is installed, but the local server did not respond.",
+                    "You can let VORTEX try to start Ollama, or start it yourself and retry.",
+                    f"Expected endpoint: {OLLAMA_OPENAI_BASE_URL}",
+                ],
+                options=[
+                    ("1", "Start Ollama", "Try to launch the local Ollama server now."),
+                    ("2", "Retry", "Check the local Ollama server again."),
+                    ("3", "Back", "Return and choose another local model."),
+                    ("4", "External API", "Skip local setup for now."),
+                ]
+                if allow_external
+                else [
+                    ("1", "Start Ollama", "Try to launch the local Ollama server now."),
+                    ("2", "Retry", "Check the local Ollama server again."),
+                    ("3", "Back", "Return and choose another local model."),
+                ],
+                error_message=start_error or _clean_error_message(exc),
+            )
+            if choice == "1":
+                started, result = await _start_ollama_with_permission(
+                    requested_cwd=requested_cwd,
+                    tui=tui,
+                    allow_external=allow_external,
+                )
+                if started:
+                    start_error = None
+                    continue
+                if result == "__external__":
+                    return "external", None
+                if result:
+                    start_error = result
+                continue
+            if choice == "2":
+                start_error = None
+                continue
+            if choice == "3":
+                return "back", None
+            return "external", None
+
+        if model_name not in installed_models:
+            models_dir = resolve_ollama_models_dir()
+            free_bytes = get_free_space_bytes(models_dir)
+            total_memory_bytes = get_total_memory_bytes()
+            requirement = describe_local_model_requirement(model_name)
+            issues = local_model_requirement_issues(
+                requirement,
+                free_bytes=free_bytes,
+                total_memory_bytes=total_memory_bytes,
+            )
+
+            if issues:
+                next_step = await _prompt_for_local_model_alternative(
+                    requested_cwd=requested_cwd,
+                    tui=tui,
+                    model_name=model_name,
+                    free_bytes=free_bytes,
+                    total_memory_bytes=total_memory_bytes,
+                    issues=issues,
+                    allow_external=allow_external,
+                )
+                if next_step == "__retry__":
+                    continue
+                if next_step == "__back__":
+                    return "back", None
+                if next_step == "__external__":
+                    return "external", None
+                model_name = next_step
+                continue
+
+            choice = await _prompt_validated_setup_decision(
+                tui=tui,
+                badge_label="Download",
+                title="Download local model",
+                workspace_dir=requested_cwd,
+                body_lines=_local_model_download_lines(
+                    model_name=model_name,
+                    free_bytes=free_bytes,
+                    total_memory_bytes=total_memory_bytes,
+                ),
+                options=_local_setup_options(
+                    primary=("1", "Download now", "Pull the model with Ollama now."),
+                    secondary=("2", "Back", "Return and choose another local model."),
+                    allow_external=allow_external,
+                ),
+            )
+            if choice == "2":
+                return "back", None
+            if allow_external and choice == "3":
+                return "external", None
+
+            try:
+                tui.show_status(f"Local setup: pulling {model_name}")
+                await pull_model(
+                    model_name,
+                    progress_callback=lambda message: tui.show_status(
+                        f"Local setup: {message}"
+                    ),
+                )
+            except Exception as exc:
+                tui.clear_status()
+                next_step = await _prompt_for_local_model_alternative(
+                    requested_cwd=requested_cwd,
+                    tui=tui,
+                    model_name=model_name,
+                    free_bytes=free_bytes,
+                    total_memory_bytes=total_memory_bytes,
+                    issues=[
+                        "The local model download did not finish.",
+                        "Choose a smaller model that fits, retry, or go back.",
+                    ],
+                    allow_external=allow_external,
+                    error_message=_clean_error_message(exc),
+                )
+                if next_step == "__retry__":
+                    continue
+                if next_step == "__back__":
+                    return "back", None
+                if next_step == "__external__":
+                    return "external", None
+                model_name = next_step
+                continue
+            finally:
+                tui.clear_status()
+
+            continue
+
+        upsert_env_file(
+            env_path,
+            {
+                "BASE_URL": OLLAMA_OPENAI_BASE_URL,
+                "MODEL_NAME": model_name,
+                "API_KEY": "",
+            },
+        )
+        _activate_workspace_env(requested_cwd)
+
+        reloaded_config, errors = _load_config_with_errors(requested_cwd)
+        credential_errors, other_errors = split_config_errors(errors)
+        if other_errors:
+            raise ValueError("\n".join(other_errors))
+        if credential_errors:
+            raise ValueError("\n".join(credential_errors))
+        return "configured", reloaded_config
+
+
 async def _prompt_for_local_ollama_setup(
     *,
     requested_cwd: Path,
@@ -1854,255 +2444,12 @@ async def _complete_local_ollama_setup(
     option: LocalModelOption,
     allow_external: bool = True,
 ) -> tuple[str, Config | None]:
-    env_path = requested_cwd / ".env"
-    install_error: str | None = None
-    start_error: str | None = None
-
-    while True:
-        if not is_ollama_installed():
-            if supports_automatic_ollama_install():
-                choice = await _prompt_validated_setup_decision(
-                    tui=tui,
-                    badge_label="Local",
-                    title="Ollama missing",
-                    workspace_dir=requested_cwd,
-                    body_lines=[
-                        "Ollama is not installed on this device yet.",
-                        "VORTEX can run Ollama's official installer if you want.",
-                        f"Manual docs: {ollama_install_docs_url()}",
-                    ],
-                    options=[
-                        (
-                            "1",
-                            "Install Ollama",
-                            "Run the official Ollama installer with your permission.",
-                        ),
-                        ("2", "Retry", "Check again after installing Ollama."),
-                        ("3", "Back", "Pick a different local model."),
-                        ("4", "External API", "Skip local setup for now."),
-                    ]
-                    if allow_external
-                    else [
-                        (
-                            "1",
-                            "Install Ollama",
-                            "Run the official Ollama installer with your permission.",
-                        ),
-                        ("2", "Retry", "Check again after installing Ollama."),
-                        ("3", "Back", "Pick a different local model."),
-                    ],
-                    error_message=install_error,
-                    info_message=(
-                        f"Local setup targets {option.model_name} once Ollama is available."
-                    ),
-                )
-                if choice == "1":
-                    installed, result = await _install_ollama_with_permission(
-                        requested_cwd=requested_cwd,
-                        tui=tui,
-                        allow_external=allow_external,
-                    )
-                    if installed:
-                        install_error = None
-                        continue
-                    if result == "__external__":
-                        return "external", None
-                    if result:
-                        install_error = result
-                    continue
-                if choice == "2":
-                    install_error = None
-                    continue
-                if choice == "3":
-                    return "back", None
-                return "external", None
-
-            choice = await _prompt_validated_setup_decision(
-                tui=tui,
-                badge_label="Local",
-                title="Ollama missing",
-                workspace_dir=requested_cwd,
-                body_lines=[
-                    "Ollama is not installed on this device yet.",
-                    "Install Ollama first, then come back and choose Retry.",
-                    f"Manual docs: {ollama_install_docs_url()}",
-                ],
-                options=_local_setup_options(
-                    primary=("1", "Retry", "Check again after installing Ollama."),
-                    secondary=("2", "Back", "Pick a different local model."),
-                    allow_external=allow_external,
-                ),
-                error_message=install_error,
-                info_message=(
-                    f"Local setup targets {option.model_name} once Ollama is available."
-                ),
-            )
-            if choice == "1":
-                install_error = None
-                continue
-            if choice == "2":
-                return "back", None
-            return "external", None
-
-        try:
-            installed_models = await list_installed_models()
-        except Exception as exc:
-            choice = await _prompt_validated_setup_decision(
-                tui=tui,
-                badge_label="Local",
-                title="Ollama not running",
-                workspace_dir=requested_cwd,
-                body_lines=[
-                    "Ollama is installed, but the local server did not respond.",
-                    "You can let VORTEX try to start Ollama, or start it yourself and retry.",
-                    f"Expected endpoint: {OLLAMA_OPENAI_BASE_URL}",
-                ],
-                options=[
-                    ("1", "Start Ollama", "Try to launch the local Ollama server now."),
-                    ("2", "Retry", "Check the local Ollama server again."),
-                    ("3", "Back", "Pick a different local model."),
-                    ("4", "External API", "Skip local setup for now."),
-                ]
-                if allow_external
-                else [
-                    ("1", "Start Ollama", "Try to launch the local Ollama server now."),
-                    ("2", "Retry", "Check the local Ollama server again."),
-                    ("3", "Back", "Pick a different local model."),
-                ],
-                error_message=start_error or _clean_error_message(exc),
-            )
-            if choice == "1":
-                started, result = await _start_ollama_with_permission(
-                    requested_cwd=requested_cwd,
-                    tui=tui,
-                    allow_external=allow_external,
-                )
-                if started:
-                    start_error = None
-                    continue
-                if result == "__external__":
-                    return "external", None
-                if result:
-                    start_error = result
-                continue
-            if choice == "2":
-                start_error = None
-                continue
-            if choice == "3":
-                return "back", None
-            return "external", None
-
-        if option.model_name not in installed_models:
-            models_dir = resolve_ollama_models_dir()
-            free_bytes = get_free_space_bytes(models_dir)
-            required_bytes = option.size_bytes
-
-            if not has_enough_space(
-                required_bytes=required_bytes,
-                free_bytes=free_bytes,
-            ):
-                choice = await _prompt_validated_setup_decision(
-                    tui=tui,
-                    badge_label="Space",
-                    title="Not enough space",
-                    workspace_dir=requested_cwd,
-                    body_lines=[
-                        f"{option.model_name} needs about {format_bytes(required_bytes)}.",
-                        f"Only {format_bytes(free_bytes)} is free in {models_dir}.",
-                        "Free up more disk space, then choose Retry.",
-                    ],
-                    options=[
-                        ("1", "Back", "Pick a different local model."),
-                        ("2", "External API", "Skip local setup for now."),
-                        ("3", "Retry", "Check disk space again."),
-                    ]
-                    if allow_external
-                    else [
-                        ("1", "Back", "Pick a different local model."),
-                        ("2", "Retry", "Check disk space again."),
-                    ],
-                    default_choice="1",
-                )
-                if choice == "1":
-                    return "back", None
-                if allow_external and choice == "2":
-                    return "external", None
-                continue
-
-            choice = await _prompt_validated_setup_decision(
-                tui=tui,
-                badge_label="Download",
-                title="Download local model",
-                workspace_dir=requested_cwd,
-                body_lines=[
-                    f"Model: {option.model_name}",
-                    f"Approx download: {format_bytes(required_bytes)}",
-                    f"Free space available: {format_bytes(free_bytes)}",
-                ],
-                options=_local_setup_options(
-                    primary=("1", "Download now", "Pull the model with Ollama now."),
-                    secondary=("2", "Back", "Pick a different local model."),
-                    allow_external=allow_external,
-                ),
-            )
-            if choice == "2":
-                return "back", None
-            if allow_external and choice == "3":
-                return "external", None
-
-            try:
-                tui.show_status(f"Local setup: pulling {option.model_name}")
-                await pull_model(
-                    option.model_name,
-                    progress_callback=lambda message: tui.show_status(
-                        f"Local setup: {message}"
-                    ),
-                )
-            except Exception as exc:
-                tui.clear_status()
-                choice = await _prompt_validated_setup_decision(
-                    tui=tui,
-                    badge_label="Download",
-                    title="Download failed",
-                    workspace_dir=requested_cwd,
-                    body_lines=[
-                        "The local model download did not finish.",
-                        "You can retry, go back, or switch to an external API.",
-                    ],
-                    options=_local_setup_options(
-                        primary=("1", "Retry", "Try downloading the model again."),
-                        secondary=("2", "Back", "Pick a different local model."),
-                        allow_external=allow_external,
-                    ),
-                    error_message=_clean_error_message(exc),
-                )
-                if choice == "1":
-                    continue
-                if choice == "2":
-                    return "back", None
-                return "external", None
-            finally:
-                tui.clear_status()
-
-            continue
-
-        upsert_env_file(
-            env_path,
-            {
-                "BASE_URL": OLLAMA_OPENAI_BASE_URL,
-                "MODEL_NAME": option.model_name,
-                "API_KEY": "",
-            },
-        )
-        _activate_workspace_env(requested_cwd)
-
-        reloaded_config, errors = _load_config_with_errors(requested_cwd)
-        credential_errors, other_errors = split_config_errors(errors)
-        if other_errors:
-            raise ValueError("\n".join(other_errors))
-        if credential_errors:
-            raise ValueError("\n".join(credential_errors))
-        return "configured", reloaded_config
+    return await _complete_requested_local_ollama_model_setup(
+        requested_cwd=requested_cwd,
+        tui=tui,
+        model_name=option.model_name,
+        allow_external=allow_external,
+    )
 
 
 def _clear_local_ollama_workspace_env(requested_cwd: Path) -> None:
@@ -2191,7 +2538,14 @@ def _should_repair_local_ollama_setup(
         return False
     if record is None:
         return True
-    return record.status != "working"
+    return record.status in {
+        "offline",
+        "unavailable",
+        "error",
+        "unknown",
+        "missing-key",
+        "auth-error",
+    }
 
 
 def _should_repair_api_credentials(record: ModelHealthRecord | None) -> bool:

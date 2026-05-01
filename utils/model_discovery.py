@@ -17,6 +17,7 @@ from utils.provider_auth import resolve_client_api_key
 
 MODEL_STATUS_ORDER = (
     "working",
+    "limited",
     "quota",
     "rate-limited",
     "auth-error",
@@ -30,6 +31,7 @@ MODEL_STATUS_ORDER = (
 
 MODEL_BUCKET_ORDER = (
     "working",
+    "limited",
     "quota",
     "not-working",
 )
@@ -72,6 +74,8 @@ def model_status_bucket(status: str | None) -> str:
     normalized = (status or "unknown").strip().lower()
     if normalized == "working":
         return "working"
+    if normalized == "limited":
+        return "limited"
     if normalized in {"quota", "rate-limited"}:
         return "quota"
     return "not-working"
@@ -220,7 +224,13 @@ def flatten_model_catalog(
                         if result.cached
                         else "unknown"
                     ),
-                    note=result.error if result.cached else None,
+                    note=(
+                        record.detail
+                        if record and record.detail
+                        else result.error
+                        if result.cached
+                        else None
+                    ),
                 )
             )
 

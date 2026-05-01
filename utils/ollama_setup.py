@@ -3,7 +3,9 @@ from __future__ import annotations
 import inspect
 import ipaddress
 import json
+import math
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -22,6 +24,7 @@ OLLAMA_DOWNLOAD_URL = "https://ollama.com/download"
 OLLAMA_LINUX_DOCS_URL = "https://docs.ollama.com/linux"
 OLLAMA_MACOS_DOCS_URL = "https://docs.ollama.com/macos"
 OLLAMA_WINDOWS_DOCS_URL = "https://docs.ollama.com/windows"
+GIB = 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,15 @@ class LocalModelOption:
     title: str
     description: str
     size_bytes: int
+    recommended_memory_bytes: int
+
+
+@dataclass(frozen=True)
+class LocalModelRequirement:
+    model_name: str
+    approx_download_bytes: int | None
+    recommended_memory_bytes: int | None
+    source: str
 
 
 LOCAL_MODEL_OPTIONS: tuple[LocalModelOption, ...] = (
@@ -42,6 +54,7 @@ LOCAL_MODEL_OPTIONS: tuple[LocalModelOption, ...] = (
             "Smaller download, quicker startup, easier on laptops."
         ),
         size_bytes=986 * 1024 * 1024,
+        recommended_memory_bytes=4 * GIB,
     ),
     LocalModelOption(
         choice="2",
@@ -51,6 +64,7 @@ LOCAL_MODEL_OPTIONS: tuple[LocalModelOption, ...] = (
             "Larger download, slower than 1.5b, but usually better edits and code fixes."
         ),
         size_bytes=int(1.9 * 1024 * 1024 * 1024),
+        recommended_memory_bytes=8 * GIB,
     ),
 )
 
@@ -67,6 +81,92 @@ def get_local_model_option_by_name(model_name: str) -> LocalModelOption | None:
         if option.model_name == model_name:
             return option
     return None
+
+
+def iter_local_model_options() -> tuple[LocalModelOption, ...]:
+    return LOCAL_MODEL_OPTIONS
+
+
+def _extract_model_size_billions(model_name: str) -> float | None:
+    match = re.search(r"[:\-_/](\d+(?:\.\d+)?)b(?:$|[^\w])", model_name.lower())
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def is_lightweight_local_model(model_name: str, base_url: str | None) -> bool:
+    if not is_ollama_base_url(base_url):
+        return False
+
+    size_billions = _extract_model_size_billions(model_name)
+    if size_billions is None:
+        option = get_local_model_option_by_name(model_name)
+        if option is None:
+            return False
+        return option.size_bytes <= int(1.25 * 1024 * 1024 * 1024)
+    return size_billions <= 2.0
+
+
+def estimate_model_download_bytes(model_name: str) -> int | None:
+    option = get_local_model_option_by_name(model_name)
+    if option is not None:
+        return option.size_bytes
+
+    size_billions = _extract_model_size_billions(model_name)
+    if size_billions is None:
+        return None
+    return int(max(0.5, size_billions * 0.72) * GIB)
+
+
+def estimate_model_memory_bytes(model_name: str) -> int | None:
+    option = get_local_model_option_by_name(model_name)
+    if option is not None:
+        return option.recommended_memory_bytes
+
+    size_billions = _extract_model_size_billions(model_name)
+    if size_billions is None:
+        return None
+    return int(max(4, math.ceil(size_billions * 2.5)) * GIB)
+
+
+def describe_local_model_requirement(model_name: str) -> LocalModelRequirement:
+    option = get_local_model_option_by_name(model_name)
+    if option is not None:
+        return LocalModelRequirement(
+            model_name=model_name,
+            approx_download_bytes=option.size_bytes,
+            recommended_memory_bytes=option.recommended_memory_bytes,
+            source="exact",
+        )
+
+    size_billions = _extract_model_size_billions(model_name)
+    if size_billions is not None:
+        return LocalModelRequirement(
+            model_name=model_name,
+            approx_download_bytes=estimate_model_download_bytes(model_name),
+            recommended_memory_bytes=estimate_model_memory_bytes(model_name),
+            source="estimated",
+        )
+
+    return LocalModelRequirement(
+        model_name=model_name,
+        approx_download_bytes=None,
+        recommended_memory_bytes=None,
+        source="unknown",
+    )
+
+
+def lightweight_local_model_warning(model_name: str) -> str | None:
+    if not model_name:
+        return None
+    return (
+        f"{model_name} is a lightweight local model. "
+        "It can still attempt real workspace tasks, but tool use and instruction-following may be unreliable. "
+        "VORTEX will retry with stronger nudges when needed; qwen2.5-coder:3b or a stronger provider is more reliable."
+    )
 
 
 def is_ollama_installed() -> bool:
@@ -155,6 +255,44 @@ def get_free_space_bytes(path: Path | None = None) -> int:
     return shutil.disk_usage(target).free
 
 
+def get_total_memory_bytes() -> int | None:
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class _MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = _MemoryStatus()
+            status.dwLength = ctypes.sizeof(_MemoryStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys)
+        except Exception:
+            return None
+
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        phys_pages = os.sysconf("SC_PHYS_PAGES")
+        if isinstance(page_size, int) and isinstance(phys_pages, int):
+            total = page_size * phys_pages
+            if total > 0:
+                return total
+    except (AttributeError, OSError, ValueError):
+        return None
+
+    return None
+
+
 def has_enough_space(
     *,
     required_bytes: int,
@@ -174,6 +312,55 @@ def format_bytes(num_bytes: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024
     return f"{num_bytes} B"
+
+
+def local_model_requirement_issues(
+    requirement: LocalModelRequirement,
+    *,
+    free_bytes: int,
+    total_memory_bytes: int | None,
+) -> list[str]:
+    issues: list[str] = []
+
+    if requirement.approx_download_bytes is not None and not has_enough_space(
+        required_bytes=requirement.approx_download_bytes,
+        free_bytes=free_bytes,
+    ):
+        issues.append(
+            f"{requirement.model_name} needs about {format_bytes(requirement.approx_download_bytes)} of model storage."
+        )
+
+    if (
+        requirement.recommended_memory_bytes is not None
+        and total_memory_bytes is not None
+        and total_memory_bytes < requirement.recommended_memory_bytes
+    ):
+        issues.append(
+            f"{requirement.model_name} usually needs about {format_bytes(requirement.recommended_memory_bytes)} of system memory."
+        )
+
+    return issues
+
+
+def fitting_local_model_options(
+    *,
+    free_bytes: int,
+    total_memory_bytes: int | None,
+    exclude_models: set[str] | None = None,
+) -> list[LocalModelOption]:
+    excluded = exclude_models or set()
+    fitting: list[LocalModelOption] = []
+    for option in LOCAL_MODEL_OPTIONS:
+        if option.model_name in excluded:
+            continue
+        requirement = describe_local_model_requirement(option.model_name)
+        if not local_model_requirement_issues(
+            requirement,
+            free_bytes=free_bytes,
+            total_memory_bytes=total_memory_bytes,
+        ):
+            fitting.append(option)
+    return fitting
 
 
 async def list_installed_models(api_base_url: str = OLLAMA_API_BASE_URL) -> list[str]:

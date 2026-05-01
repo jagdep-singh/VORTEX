@@ -24,10 +24,12 @@ from utils.model_health import ModelHealthRecord
 class ModelDiscoveryConfigTests(unittest.TestCase):
     def test_model_status_bucket_collapses_detailed_errors(self) -> None:
         self.assertEqual(model_status_bucket("working"), "working")
+        self.assertEqual(model_status_bucket("limited"), "limited")
         self.assertEqual(model_status_bucket("quota"), "quota")
         self.assertEqual(model_status_bucket("rate-limited"), "quota")
         self.assertEqual(model_status_bucket("auth-error"), "not-working")
         self.assertEqual(model_status_bucket("unknown"), "not-working")
+        self.assertEqual(MODEL_BUCKET_ORDER[:2], ("working", "limited"))
 
     def test_profile_prefers_its_own_env_key(self) -> None:
         with patch.dict(
@@ -173,7 +175,7 @@ class ModelDiscoveryConfigTests(unittest.TestCase):
             [entry.checked_at for entry in entries],
             ["2026-04-01T01:00:00+00:00", "2026-04-01T01:05:00+00:00"],
         )
-        self.assertEqual([entry.note for entry in entries], [None, None])
+        self.assertEqual([entry.note for entry in entries], [None, "Quota exceeded"])
 
     def test_select_best_working_model_prefers_exact_current_match(self) -> None:
         results = [
