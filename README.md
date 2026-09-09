@@ -1,6 +1,6 @@
 # VORTEX
 
-**A terminal AI pair-programmer.** OpenAI-compatible brain, an aurora-themed TUI skin, a real tool belt, and workspace-aware memory — so it actually helps you ship code instead of just chatting about it.
+**A terminal AI pair-programmer.** OpenAI-compatible brain, a real tool belt, and workspace-aware memory — so it actually helps you ship code instead of just chatting about it.
 
 ```bash
 pipx install vortex-agent-cli
@@ -11,11 +11,11 @@ vortex
 
 ## Why VORTEX
 
-Most terminal AI agents are either bare-bones chat wrappers or heavyweight IDE plugins. VORTEX sits in between: a single `vortex` command that drops you into a polished, animated terminal UI backed by a real agent loop — one that can read and edit your files, run shell commands, search the web, index your codebase, and remember what it did last time, all while asking permission before anything risky happens.
+Most terminal AI agents are either bare-bones chat wrappers or heavyweight IDE plugins. VORTEX sits in between: a single `vortex` command backed by a real agent loop — one that can read and edit your files, run shell commands, search the web, index your codebase, and remember what it did last time, all while asking permission before anything risky happens.
 
 ## Highlights
 
-- **A terminal UI that doesn't look like a terminal UI** — streamed replies in a sculpted Rich interface with animated gradients and structured tool cards.
+- **Built to be used daily, not just demoed** — streamed replies, structured tool cards, and a quick round trip from prompt to applied change.
 - **Real tools, not toy demos** — read/write/edit files, shell execution, grep/glob search, a symbol index, MCP servers, checkpoints, and session persistence.
 - **Workspace-aware** — picks a working directory up front, reloads config and tools per project, and remembers recent projects.
 - **Model-aware** — provider profiles, live model discovery, health probes, and buckets for working / rate-limited / broken models.
@@ -151,7 +151,7 @@ Add `--cwd /workspace/subdir` to target a different project inside the container
 
 ```
 main.py            CLI entry point
-ui/tui.py           Aurora terminal UI
+ui/tui.py           Terminal interface
 agent/              Agent loop, events, persistence
 tools/               Builtin tools, discovery, registry, MCP client
 context/            Workspace snapshot, code index, compaction
